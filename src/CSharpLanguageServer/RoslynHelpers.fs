@@ -1,13 +1,13 @@
 module CSharpLanguageServer.RoslynHelpers
 
 open System
-open System.Linq
 open System.Collections.Generic
 open System.IO
 open System.Reflection
-open System.Threading
+open System.Threading.Tasks
 open Ionide.LanguageServerProtocol.Types
 open Microsoft.CodeAnalysis
+open Microsoft.CodeAnalysis.Host
 open Microsoft.CodeAnalysis.CodeActions
 open Microsoft.CodeAnalysis.CodeRefactorings
 open Microsoft.CodeAnalysis.CSharp
@@ -19,6 +19,10 @@ open Microsoft.CodeAnalysis.MSBuild
 open Microsoft.CodeAnalysis.CodeFixes
 open Microsoft.CodeAnalysis.CSharp.Syntax
 open System.Collections.Immutable
+open ICSharpCode.Decompiler
+open ICSharpCode.Decompiler.CSharp
+open ICSharpCode.Decompiler.CSharp.Transforms
+open Castle.DynamicProxy
 
 let roslynTagToLspCompletion tag =
     match tag with
@@ -57,7 +61,8 @@ let lspRangeForRoslynLinePosSpan (pos: LinePositionSpan): Types.Range =
       End = lspPositionForRoslynLinePosition pos.End }
 
 let lspTextEditForRoslynTextChange (docText: SourceText) (c: TextChange): Types.TextEdit =
-    { Range = docText.Lines.GetLinePositionSpan(c.Span) |> lspRangeForRoslynLinePosSpan
+    { Range = docText.Lines.GetLinePositionSpan(c.Span)
+              |> lspRangeForRoslynLinePosSpan
       NewText = c.NewText }
 
 let lspLocationForRoslynLocation(loc: Microsoft.CodeAnalysis.Location): Types.Location =
@@ -70,24 +75,28 @@ let lspLocationForRoslynLocation(loc: Microsoft.CodeAnalysis.Location): Types.Lo
         { Uri = "";
           Range = { Start = { Line=0; Character=0; }; End = { Line=0; Character=0; } } }
 
-let lspContentChangeEventToRoslynTextChange (sourceText: SourceText) (change: Types.TextDocumentContentChangeEvent) =
-    let changeTextSpan =
-        change.Range.Value
-        |> roslynLinePositionSpanForLspRange
-        |> sourceText.Lines.GetTextSpan
+let applyLspContentChangesOnRoslynSourceText
+        (changes: Types.TextDocumentContentChangeEvent[])
+        (initialSourceText: SourceText) =
 
-    TextChange(changeTextSpan, change.Text)
+    let applyLspContentChangeOnRoslynSourceText (sourceText: SourceText) (change: Types.TextDocumentContentChangeEvent) =
+        match change.Range with
+        | Some changeRange ->
+            let changeTextSpan =
+                changeRange |> roslynLinePositionSpanForLspRange
+                            |> sourceText.Lines.GetTextSpan
 
-let applyLspContentChangesOnRoslynSourceText (changes: Types.TextDocumentContentChangeEvent[]) (sourceText: SourceText) =
-    changes
-    |> Seq.map (lspContentChangeEventToRoslynTextChange sourceText)
-    |> sourceText.WithChanges
+            TextChange(changeTextSpan, change.Text) |> sourceText.WithChanges
+
+        | None -> SourceText.From(change.Text)
+
+    changes |> Seq.fold applyLspContentChangeOnRoslynSourceText initialSourceText
 
 let lspDocChangesFromSolutionDiff
         originalSolution
         (updatedSolution: Solution)
         (tryGetDocVersionByUri: string -> int option)
-        logMessage
+        _logMessage
         (originatingDoc: Document)
         : Async<Types.TextDocumentEdit list> = async {
 
@@ -153,18 +162,19 @@ let lspDocChangesFromSolutionDiff
 
 type CodeActionData = { Url: string }
 
-let asyncMaybeOnException op = async {
+let asyncMaybeOnException logMessage op = async {
     try
         let! value = op ()
         return Some value
-    with _ex ->
+    with ex ->
+        logMessage (string ex)
         return None
 }
 
 let lspCodeActionDetailsFromRoslynCA ca =
     let typeName = ca.GetType() |> string
     if typeName.Contains("CodeAnalysis.AddImport") then
-        Some Types.CodeActionKind.SourceOrganizeImports, Some true
+        Some Types.CodeActionKind.QuickFix, Some true
     else
         None, None
 
@@ -190,7 +200,7 @@ let roslynCodeActionToResolvedLspCodeAction
 
     let! ct = Async.CancellationToken
 
-    let! maybeOps = asyncMaybeOnException (fun () -> ca.GetOperationsAsync(ct) |> Async.AwaitTask)
+    let! maybeOps = asyncMaybeOnException logMessage (fun () -> ca.GetOperationsAsync(ct) |> Async.AwaitTask)
 
     match maybeOps with
     | None -> return None
@@ -231,154 +241,283 @@ let formatSymbol (sym: ISymbol)
     | true, _, _ -> sym.ToDisplayString()
     | false, _, _ -> sym.Name
 
-let symbolToLspSymbolInformation
-        showAttributes
-        (symbol: ISymbol)
+let getSymbolNameAndKind
         (semanticModel: SemanticModel option)
         (pos: int option)
-        : Types.SymbolInformation =
-    let (symbolName, symbolKind) =
-        match symbol with
-        | :? ILocalSymbol as ls ->
-            (formatSymbol ls showAttributes semanticModel pos,
-             Types.SymbolKind.Variable)
+        (symbol: ISymbol) =
+    let showAttributes = true
 
-        | :? IFieldSymbol as fs ->
-            (formatSymbol fs showAttributes semanticModel pos,
-             Types.SymbolKind.Field)
+    match symbol with
+    | :? ILocalSymbol as ls ->
+        (formatSymbol ls showAttributes semanticModel pos,
+            Types.SymbolKind.Variable)
 
-        | :? IPropertySymbol as ps ->
-            (formatSymbol ps showAttributes semanticModel pos,
-             Types.SymbolKind.Property)
+    | :? IFieldSymbol as fs ->
+        (formatSymbol fs showAttributes semanticModel pos,
+            Types.SymbolKind.Field)
 
-        | :? IMethodSymbol as ms ->
-            (formatSymbol ms showAttributes semanticModel pos,
-             match ms.MethodKind with
-                | MethodKind.Constructor -> Types.SymbolKind.Constructor
-                | _ -> Types.SymbolKind.Method)
+    | :? IPropertySymbol as ps ->
+        (formatSymbol ps showAttributes semanticModel pos,
+            Types.SymbolKind.Property)
 
-        | _ ->
-            (symbol.ToString(), Types.SymbolKind.File)
+    | :? IMethodSymbol as ms ->
+        (formatSymbol ms showAttributes semanticModel pos,
+            match ms.MethodKind with
+            | MethodKind.Constructor -> Types.SymbolKind.Constructor
+            | _ -> Types.SymbolKind.Method)
 
-    { Name = symbolName
-      Kind = symbolKind
-      Location = symbol.Locations |> Seq.head |> lspLocationForRoslynLocation
-      ContainerName = None }
+    | :? ITypeSymbol as ts ->
+        (formatSymbol ts showAttributes semanticModel pos,
+            match ts.TypeKind with
+            | TypeKind.Class -> Types.SymbolKind.Class
+            | TypeKind.Enum -> Types.SymbolKind.Enum
+            | TypeKind.Struct -> Types.SymbolKind.Struct
+            | TypeKind.Interface -> Types.SymbolKind.Interface
+            | TypeKind.Delegate -> Types.SymbolKind.Function
+            | TypeKind.Array -> Types.SymbolKind.Array
+            | _ -> Types.SymbolKind.Class)
 
+    | _ ->
+        (symbol.ToString(), Types.SymbolKind.File)
 
-type DocumentSymbolCollector (documentUri, semanticModel: SemanticModel, showAttributes) =
+let rec flattenDocumentSymbol (node: Types.DocumentSymbol) =
+    let nodeWithNoChildren =
+        { node with Children = None }
+
+    let flattenedChildren =
+        match node.Children with
+        | None -> []
+        | Some xs -> xs |> Seq.map flattenDocumentSymbol |> Seq.concat |> List.ofSeq
+
+    nodeWithNoChildren :: flattenedChildren
+
+type DocumentSymbolCollector (docText: SourceText, semanticModel: SemanticModel) =
     inherit CSharpSyntaxWalker(SyntaxWalkerDepth.Token)
 
-    let mutable collectedSymbols: Types.SymbolInformation list = []
+    let mutable symbolStack = []
 
-    let collect (symbol: ISymbol) (identifier: SyntaxToken) =
-        let identifierLocation: Types.Location =
-            { Uri = documentUri
-              Range = identifier.GetLocation().GetLineSpan().Span |> lspRangeForRoslynLinePosSpan
-            }
+    let push (node: SyntaxNode) (identifier: SyntaxToken) =
+        let symbol = semanticModel.GetDeclaredSymbol(node)
 
-        let rawSymbol = symbolToLspSymbolInformation showAttributes symbol None None
-        let symbol = { rawSymbol with Location = identifierLocation }
+        let (fullSymbolName, symbolKind) =
+            getSymbolNameAndKind (Some semanticModel)
+                                 (Some identifier.Span.Start)
+                                 symbol
 
-        collectedSymbols <- symbol :: collectedSymbols
+        let lspRange =
+            node.FullSpan
+            |> docText.Lines.GetLinePositionSpan
+            |> lspRangeForRoslynLinePosSpan
 
-    member __.GetSymbols() = collectedSymbols |> List.rev |> Array.ofList
+        let selectionLspRange =
+            identifier.GetLocation().GetLineSpan().Span
+            |> lspRangeForRoslynLinePosSpan
+
+        let symbolDetail =
+            match symbolKind with
+            | Types.SymbolKind.Class -> None
+            | Types.SymbolKind.Struct -> None
+            | _ -> Some fullSymbolName
+
+        let docSymbol = {
+            Name           = symbol.Name
+            Detail         = symbolDetail
+            Kind           = symbolKind
+            Range          = lspRange
+            SelectionRange = selectionLspRange
+            Children       = None
+        }
+
+        symbolStack <- docSymbol :: symbolStack
+
+    let pop (_node: SyntaxNode) =
+        let symbolStack' =
+            match symbolStack with
+            | [] -> Exception("symbolStack is empty") |> raise
+            | [_] -> []
+            | top :: restPastTop ->
+                match restPastTop with
+                | [] -> Exception("restPastTop is empty") |> raise
+                | parent :: restPastParent ->
+                    let parentWithTopAsChild =
+                        let newChildren =
+                            parent.Children
+                            |> Option.defaultValue Array.empty
+                            |> List.ofSeq
+                            |> fun xs -> xs @ [top]
+                            |> Array.ofSeq
+
+                        { parent with Children = Some newChildren }
+
+                    let poppedSymbolStack = parentWithTopAsChild :: restPastParent
+
+                    poppedSymbolStack
+
+        symbolStack <- symbolStack'
+
+    member __.Init(moduleName: string) =
+        let emptyRange = { Start={ Line=0; Character=0 }
+                           End={ Line=0; Character=0 } }
+
+        let root: DocumentSymbol = {
+            Name           = moduleName
+            Detail         = None
+            Kind           = SymbolKind.File
+            Range          = emptyRange
+            SelectionRange = emptyRange
+            Children       = None
+        }
+
+        symbolStack <- [root]
+
+    member __.GetDocumentSymbols (clientSupportsDocSymbolHierarchy: bool) =
+        let root =
+            match symbolStack with
+            | [root] -> root
+            | _ -> Exception("symbolStack is not a single node") |> raise
+
+        if clientSupportsDocSymbolHierarchy then
+            [| root |]
+        else
+            root |> flattenDocumentSymbol |> Array.ofSeq
+
+    override __.VisitEnumDeclaration(node) =
+        push node node.Identifier
+        base.VisitEnumDeclaration(node)
+        pop node
+
+    override __.VisitEnumMemberDeclaration(node) =
+        push node node.Identifier
+        base.VisitEnumMemberDeclaration(node)
+        pop node
 
     override __.VisitClassDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        push node node.Identifier
         base.VisitClassDeclaration(node)
+        pop node
+
+    override __.VisitRecordDeclaration(node) =
+        push node node.Identifier
+        base.VisitRecordDeclaration(node)
+        pop node
 
     override __.VisitConstructorDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        push node node.Identifier
         base.VisitConstructorDeclaration(node)
+        pop node
 
     override __.VisitMethodDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        push node node.Identifier
         base.VisitMethodDeclaration(node)
+        pop node
 
     override __.VisitPropertyDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        push node node.Identifier
         base.VisitPropertyDeclaration(node)
+        pop node
 
     override __.VisitEventDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        push node node.Identifier
         base.VisitEventDeclaration(node)
+        pop node
 
 
 type DocumentSymbolCollectorForCodeLens (semanticModel: SemanticModel) =
     inherit CSharpSyntaxWalker(SyntaxWalkerDepth.Token)
 
-    let mutable collectedSymbols: (ISymbol * Location) list = []
+    let mutable collectedSymbols = []
 
-    let collect (symbol: ISymbol) (identifier: SyntaxToken) =
+    let collect (node: SyntaxNode) (identifier: SyntaxToken) =
+        let symbol = semanticModel.GetDeclaredSymbol(node)
         collectedSymbols <- (symbol, identifier.GetLocation()) :: collectedSymbols
 
     member __.GetSymbols() = collectedSymbols |> List.rev |> Array.ofList
 
+    override __.VisitEnumDeclaration(node) =
+        collect node node.Identifier
+        base.VisitEnumDeclaration(node)
+
+    override __.VisitEnumMemberDeclaration(node) =
+        collect node node.Identifier
+        base.VisitEnumMemberDeclaration(node)
+
     override __.VisitClassDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        collect node node.Identifier
         base.VisitClassDeclaration(node)
 
+    override __.VisitRecordDeclaration(node) =
+        collect node node.Identifier
+        base.VisitRecordDeclaration(node)
+
     override __.VisitConstructorDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        collect node node.Identifier
         base.VisitConstructorDeclaration(node)
 
     override __.VisitMethodDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        collect node node.Identifier
         base.VisitMethodDeclaration(node)
 
     override __.VisitPropertyDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        collect node node.Identifier
         base.VisitPropertyDeclaration(node)
 
     override __.VisitEventDeclaration(node) =
-        let symbol = semanticModel.GetDeclaredSymbol(node)
-        collect symbol node.Identifier
+        collect node node.Identifier
         base.VisitEventDeclaration(node)
 
 
-type DocumentSymbolCollectorForMatchingSymbolName (documentUri, symbolName: string) =
+type DocumentSymbolCollectorForMatchingSymbolName
+        (documentUri, sym: ISymbol, _logMessage: string -> unit) =
     inherit CSharpSyntaxWalker(SyntaxWalkerDepth.Token)
 
-    let mutable collectedLocations: Types.Location list = []
+    let mutable collectedLocations = []
+    let mutable suggestedLocations = []
 
-    let collectIdentifier (identifier: SyntaxToken) =
-        if identifier.ValueText = symbolName then
-            let location: Types.Location =
-                { Uri = documentUri
-                  Range = identifier.GetLocation().GetLineSpan().Span
-                          |> lspRangeForRoslynLinePosSpan }
+    let collectIdentifier (identifier: SyntaxToken) exactMatch =
+        let location: Types.Location =
+            { Uri = documentUri
+              Range = identifier.GetLocation().GetLineSpan().Span
+                      |> lspRangeForRoslynLinePosSpan }
 
+        if exactMatch then
             collectedLocations <- location :: collectedLocations
+        else
+            suggestedLocations <- location :: suggestedLocations
 
-    member __.GetLocations() = collectedLocations |> Seq.rev |> List.ofSeq
+    member __.GetLocations() =
+        if not (Seq.isEmpty collectedLocations) then
+            collectedLocations |> Seq.rev |> List.ofSeq
+        else
+            suggestedLocations |> Seq.rev |> List.ofSeq
 
     override __.Visit(node) =
-        // TODO: collect other type of syntax nodes too
-        if node :? MethodDeclarationSyntax then
-            let methodDecl = node :?> MethodDeclarationSyntax
-            collectIdentifier methodDecl.Identifier
+        if sym.Kind = SymbolKind.Method then
+            if node :? MethodDeclarationSyntax then
+                let nodeMethodDecl = node :?> MethodDeclarationSyntax
 
-        else if node :? TypeDeclarationSyntax then
-             let typeDecl = node :?> TypeDeclarationSyntax
-             collectIdentifier typeDecl.Identifier
+                if nodeMethodDecl.Identifier.ValueText = sym.Name then
+                    let methodArityMatches =
+                        let symMethod = sym :?> IMethodSymbol
+                        symMethod.Parameters.Length = nodeMethodDecl.ParameterList.Parameters.Count
 
-        else if node :? PropertyDeclarationSyntax then
-             let propertyDecl = node :?> PropertyDeclarationSyntax
-             collectIdentifier propertyDecl.Identifier
+                    collectIdentifier nodeMethodDecl.Identifier methodArityMatches
+        else
+            if node :? TypeDeclarationSyntax then
+                let typeDecl = node :?> TypeDeclarationSyntax
+                if typeDecl.Identifier.ValueText = sym.Name then
+                    collectIdentifier typeDecl.Identifier false
 
-        else if node :? EventDeclarationSyntax then
-             let eventDecl = node :?> EventDeclarationSyntax
-             collectIdentifier eventDecl.Identifier
+            else if node :? PropertyDeclarationSyntax then
+                let propertyDecl = node :?> PropertyDeclarationSyntax
+                if propertyDecl.Identifier.ValueText = sym.Name then
+                    collectIdentifier propertyDecl.Identifier false
+
+            else if node :? EventDeclarationSyntax then
+                let eventDecl = node :?> EventDeclarationSyntax
+                if eventDecl.Identifier.ValueText = sym.Name then
+                    collectIdentifier eventDecl.Identifier false
+
+            // TODO: collect other type of syntax nodes too
 
         base.Visit(node)
 
@@ -387,15 +526,19 @@ let roslynToLspDiagnosticSeverity s: Types.DiagnosticSeverity option =
     | Microsoft.CodeAnalysis.DiagnosticSeverity.Info -> Some Types.DiagnosticSeverity.Information
     | Microsoft.CodeAnalysis.DiagnosticSeverity.Warning -> Some Types.DiagnosticSeverity.Warning
     | Microsoft.CodeAnalysis.DiagnosticSeverity.Error -> Some Types.DiagnosticSeverity.Error
-    | Microsoft.CodeAnalysis.DiagnosticSeverity.Hidden -> None
-    | _ -> None
+    | _ -> Some Types.DiagnosticSeverity.Warning
 
 let roslynToLspDiagnostic (d: Microsoft.CodeAnalysis.Diagnostic) : Types.Diagnostic =
+    let diagnosticsCodeUrl =
+          d.Id.ToLowerInvariant()
+          |> (sprintf "https://docs.microsoft.com/en-us/dotnet/csharp/misc/%s")
+          |> Uri
+
     { Range = d.Location.GetLineSpan().Span |> lspRangeForRoslynLinePosSpan
       Severity = d.Severity |> roslynToLspDiagnosticSeverity
-      Code = None
-      CodeDescription = None
-      Source = "lsp"
+      Code = Some d.Id
+      CodeDescription = Some { Href = Some diagnosticsCodeUrl }
+      Source = Some "lsp"
       Message = d.GetMessage()
       RelatedInformation = None
       Tags = None
@@ -414,7 +557,16 @@ let findSymbolsInSolution (solution: Solution)
 
         symbolsFound <- (List.ofSeq symbols) @ symbolsFound
 
-    return Seq.map (fun s -> symbolToLspSymbolInformation true s None None) symbolsFound
+    let symbolToLspSymbolInformation (symbol: ISymbol) : Types.SymbolInformation =
+        let (symbolName, symbolKind) = getSymbolNameAndKind None None symbol
+
+        { Name = symbolName
+          Kind = symbolKind
+          Location = symbol.Locations |> Seq.head |> lspLocationForRoslynLocation
+          ContainerName = None }
+
+    return symbolsFound
+           |> Seq.map symbolToLspSymbolInformation
            |> List.ofSeq
 }
 
@@ -459,19 +611,225 @@ let codeFixProviderInstances =
     instantiateRoslynProviders<CodeFixProvider>
         (fun _ -> true)
 
+type CleanCodeGenerationOptionsProviderInterceptor (_logMessage) =
+    interface IInterceptor with
+        member __.Intercept(invocation: IInvocation) =
+            match invocation.Method.Name with
+            "GetCleanCodeGenerationOptionsAsync" ->
+                let workspacesAssembly = Assembly.Load("Microsoft.CodeAnalysis.Workspaces")
+                let cleanCodeGenOptionsType = workspacesAssembly.GetType("Microsoft.CodeAnalysis.CodeGeneration.CleanCodeGenerationOptions")
+
+                let methodGetDefault = cleanCodeGenOptionsType.GetMethod("GetDefault")
+
+                let argLanguageServices = invocation.Arguments[0]
+                let defaultCleanCodeGenOptions = methodGetDefault.Invoke(null, [| argLanguageServices |])
+
+                let valueTaskType = typedefof<ValueTask<_>>
+                let valueTaskTypeForCleanCodeGenOptions = valueTaskType.MakeGenericType([| cleanCodeGenOptionsType |])
+
+                invocation.ReturnValue <-
+                    Activator.CreateInstance(valueTaskTypeForCleanCodeGenOptions, defaultCleanCodeGenOptions)
+
+            | _ ->
+                NotImplementedException(string invocation.Method) |> raise
+
+type LegacyWorkspaceOptionServiceInterceptor (logMessage) =
+    interface IInterceptor with
+        member __.Intercept(invocation: IInvocation) =
+            //logMessage (sprintf "LegacyWorkspaceOptionServiceInterceptor: %s" (string invocation.Method))
+
+            match invocation.Method.Name with
+            | "RegisterWorkspace" ->
+                ()
+            | "GetGenerateEqualsAndGetHashCodeFromMembersGenerateOperators" ->
+                invocation.ReturnValue <- box true
+            | "GetGenerateEqualsAndGetHashCodeFromMembersImplementIEquatable" ->
+                invocation.ReturnValue <- box true
+            | "GetGenerateConstructorFromMembersOptionsAddNullChecks" ->
+                invocation.ReturnValue <- box true
+            | "get_GenerateOverrides" ->
+                invocation.ReturnValue <- box true
+            | "get_CleanCodeGenerationOptionsProvider" ->
+                let workspacesAssembly = Assembly.Load("Microsoft.CodeAnalysis.Workspaces")
+                let cleanCodeGenOptionsProvType = workspacesAssembly.GetType("Microsoft.CodeAnalysis.CodeGeneration.AbstractCleanCodeGenerationOptionsProvider")
+
+                let generator = ProxyGenerator()
+                let interceptor = CleanCodeGenerationOptionsProviderInterceptor(logMessage)
+                let proxy = generator.CreateClassProxy(cleanCodeGenOptionsProvType, interceptor)
+                invocation.ReturnValue <- proxy
+
+            | _ ->
+                NotImplementedException(string invocation.Method) |> raise
+
+type PickMembersServiceInterceptor (_logMessage) =
+    interface IInterceptor with
+         member __.Intercept(invocation: IInvocation) =
+
+            match invocation.Method.Name with
+            | "PickMembers" ->
+                let argMembers = invocation.Arguments[1]
+                let argOptions = invocation.Arguments[2]
+
+                let pickMembersResultType = invocation.Method.ReturnType
+
+                invocation.ReturnValue <-
+                    Activator.CreateInstance(pickMembersResultType, argMembers, argOptions, box true)
+
+            | _ ->
+                NotImplementedException(string invocation.Method) |> raise
+
+type ExtractClassOptionsServiceInterceptor (_logMessage) =
+    interface IInterceptor with
+        member __.Intercept(invocation: IInvocation) =
+
+            match invocation.Method.Name with
+            | "GetExtractClassOptionsAsync" ->
+                let _argDocument = invocation.Arguments[0] :?> Document
+                let argOriginalType = invocation.Arguments[1] :?> INamedTypeSymbol
+                let _argSelectedMembers = invocation.Arguments[2] :?> ImmutableArray<ISymbol>
+
+                let featuresAssembly = Assembly.Load("Microsoft.CodeAnalysis.Features")
+                let extractClassOptionsType = featuresAssembly.GetType("Microsoft.CodeAnalysis.ExtractClass.ExtractClassOptions")
+
+                let typeName = "Base" + argOriginalType.Name
+                let fileName = typeName + ".cs"
+                let sameFile = box true
+
+                let immArrayType = typeof<ImmutableArray>
+                let extractClassMemberAnalysisResultType = featuresAssembly.GetType("Microsoft.CodeAnalysis.ExtractClass.ExtractClassMemberAnalysisResult")
+
+                let resultListType = typedefof<List<_>>.MakeGenericType(extractClassMemberAnalysisResultType)
+                let resultList = Activator.CreateInstance(resultListType)
+
+                let memberFilter (m: ISymbol) =
+                    match m with
+                    | :? IMethodSymbol as ms -> ms.MethodKind = MethodKind.Ordinary
+                    | :? IFieldSymbol as fs -> not fs.IsImplicitlyDeclared
+                    | _ -> m.Kind = SymbolKind.Property || m.Kind = SymbolKind.Event
+
+                let selectedMembersToAdd =
+                    argOriginalType.GetMembers()
+                    |> Seq.filter memberFilter
+
+                for memberToAdd in selectedMembersToAdd do
+                    let memberAnalysisResult =
+                        Activator.CreateInstance(extractClassMemberAnalysisResultType, memberToAdd, false)
+
+                    resultListType.GetMethod("Add").Invoke(resultList, [| memberAnalysisResult |])
+                    |> ignore
+
+                let resultListAsArray =
+                    resultListType.GetMethod("ToArray").Invoke(resultList, null)
+
+                let immArrayCreateFromArray =
+                    immArrayType.GetMethods()
+                    |> Seq.filter (fun m -> m.GetParameters().Length = 1 && (m.GetParameters()[0]).ParameterType.IsArray)
+                    |> Seq.head
+
+                let emptyMemberAnalysisResults =
+                    immArrayCreateFromArray.MakeGenericMethod([| extractClassMemberAnalysisResultType |]).Invoke(null, [| resultListAsArray |])
+
+                let extractClassOptionsValue =
+                    Activator.CreateInstance(
+                        extractClassOptionsType, fileName, typeName, sameFile, emptyMemberAnalysisResults)
+
+                let fromResultMethod = typeof<Task>.GetMethod("FromResult")
+                let typedFromResultMethod = fromResultMethod.MakeGenericMethod([| extractClassOptionsType |])
+
+                invocation.ReturnValue <-
+                    typedFromResultMethod.Invoke(null, [| extractClassOptionsValue |])
+
+            | _ ->
+                NotImplementedException(string invocation.Method) |> raise
+
+type MoveStaticMembersOptionsServiceInterceptor (_logMessage) =
+    interface IInterceptor with
+       member __.Intercept(invocation: IInvocation) =
+
+            match invocation.Method.Name with
+            | "GetMoveMembersToTypeOptions" ->
+                let _argDocument = invocation.Arguments[0] :?> Document
+                let _argOriginalType = invocation.Arguments[1] :?> INamedTypeSymbol
+                let argSelectedMembers = invocation.Arguments[2] :?> ImmutableArray<ISymbol>
+
+                let featuresAssembly = Assembly.Load("Microsoft.CodeAnalysis.Features")
+                let msmOptionsType = featuresAssembly.GetType("Microsoft.CodeAnalysis.MoveStaticMembers.MoveStaticMembersOptions")
+
+                let newStaticClassName = "NewStaticClass"
+
+                let msmOptions =
+                    Activator.CreateInstance(
+                        msmOptionsType,
+                        newStaticClassName + ".cs",
+                        newStaticClassName,
+                        argSelectedMembers,
+                        false |> box)
+
+                invocation.ReturnValue <- msmOptions
+
+            | _ ->
+                NotImplementedException(string invocation.Method) |> raise
+
+type WorkspaceServicesInterceptor (logMessage) =
+    interface IInterceptor with
+        member __.Intercept(invocation: IInvocation) =
+            invocation.Proceed()
+
+            if invocation.Method.Name = "GetService" && invocation.ReturnValue = null then
+                let updatedReturnValue =
+                    let serviceType = invocation.GenericArguments[0]
+                    let generator = ProxyGenerator()
+
+                    match serviceType.FullName with
+                    | "Microsoft.CodeAnalysis.Options.ILegacyGlobalOptionsWorkspaceService" ->
+                        let interceptor = LegacyWorkspaceOptionServiceInterceptor(logMessage)
+                        generator.CreateInterfaceProxyWithoutTarget(serviceType, interceptor)
+
+                    | "Microsoft.CodeAnalysis.PickMembers.IPickMembersService" ->
+                        let interceptor = PickMembersServiceInterceptor(logMessage)
+                        generator.CreateInterfaceProxyWithoutTarget(serviceType, interceptor)
+
+                    | "Microsoft.CodeAnalysis.ExtractClass.IExtractClassOptionsService" ->
+                        let interceptor = ExtractClassOptionsServiceInterceptor(logMessage)
+                        generator.CreateInterfaceProxyWithoutTarget(serviceType, interceptor)
+
+                    | "Microsoft.CodeAnalysis.MoveStaticMembers.IMoveStaticMembersOptionsService" ->
+                        let interceptor = MoveStaticMembersOptionsServiceInterceptor(logMessage)
+                        generator.CreateInterfaceProxyWithoutTarget(serviceType, interceptor)
+
+                    | _ ->
+                        //logMessage (sprintf "WorkspaceServicesInterceptor: GetService(%s) resulted in null!" serviceType.FullName)
+                        null
+
+                invocation.ReturnValue <- updatedReturnValue
+
+let interceptWorkspaceServices logMessage msbuildWorkspace =
+    let workspaceType = typeof<Workspace>
+    let workspaceServicesField = workspaceType.GetField("_services", BindingFlags.Instance ||| BindingFlags.NonPublic)
+
+    let generator = ProxyGenerator()
+    let interceptor = WorkspaceServicesInterceptor(logMessage)
+
+    let interceptedWorkspaceServices =
+        workspaceServicesField.GetValue(msbuildWorkspace)
+        |> Unchecked.unbox<HostWorkspaceServices>
+        |> (fun ws -> generator.CreateClassProxyWithTarget<HostWorkspaceServices>(ws, interceptor))
+
+    workspaceServicesField.SetValue(msbuildWorkspace, interceptedWorkspaceServices)
+
 let tryLoadSolutionOnPath logMessage solutionPath = async {
     try
-        logMessage ("loading solution: " + solutionPath)
+        logMessage (sprintf "loading solution \"%s\".." solutionPath)
 
         let msbuildWorkspace = MSBuildWorkspace.Create()
         msbuildWorkspace.LoadMetadataForReferencedProjects <- true
+        do msbuildWorkspace |> interceptWorkspaceServices logMessage
 
         let! _ = msbuildWorkspace.OpenSolutionAsync(solutionPath) |> Async.AwaitTask
 
         for diag in msbuildWorkspace.Diagnostics do
             logMessage ("msbuildWorkspace.Diagnostics: " + diag.ToString())
 
-        //workspace <- Some(msbuildWorkspace :> Workspace)
         return Some msbuildWorkspace.CurrentSolution
     with
     | ex ->
@@ -482,9 +840,10 @@ let tryLoadSolutionOnPath logMessage solutionPath = async {
 let tryLoadSolutionFromProjectFiles logMessage (projFiles: string list) = async {
     let msbuildWorkspace = MSBuildWorkspace.Create()
     msbuildWorkspace.LoadMetadataForReferencedProjects <- true
+    do msbuildWorkspace |> interceptWorkspaceServices logMessage
 
     for file in projFiles do
-        logMessage ("loading proj file " + file + "..")
+        logMessage (sprintf "loading project \"%s\".." file)
         try
             do! msbuildWorkspace.OpenProjectAsync(file) |> Async.AwaitTask |> Async.Ignore
         with ex ->
@@ -544,7 +903,20 @@ let findAndLoadSolutionOnDir logMessage dir = async {
         return solution
 }
 
-let getRoslynCodeActions (doc: Document) (textSpan: TextSpan): Async<CodeAction list> = async {
+let loadSolutionOnSolutionPathOrCwd logMessage solutionPathMaybe =
+    match solutionPathMaybe with
+    | Some solutionPath ->
+        logMessage (sprintf "loading specified solution file: %s.." solutionPath)
+        tryLoadSolutionOnPath logMessage solutionPath
+
+    | None ->
+        let cwd = Directory.GetCurrentDirectory()
+        logMessage (sprintf "attempting to find and load solution based on cwd (\"%s\").." cwd)
+        findAndLoadSolutionOnDir logMessage cwd
+
+let getRoslynCodeActions logMessage (doc: Document) (textSpan: TextSpan)
+        : Async<CodeAction list> = async {
+
     let! ct = Async.CancellationToken
 
     let roslynCodeActions = List<CodeActions.CodeAction>()
@@ -552,7 +924,10 @@ let getRoslynCodeActions (doc: Document) (textSpan: TextSpan): Async<CodeAction 
     let codeActionContext = CodeRefactoringContext(doc, textSpan, addCodeAction, ct)
 
     for refactoringProvider in refactoringProviderInstances do
-        do! refactoringProvider.ComputeRefactoringsAsync(codeActionContext) |> Async.AwaitTask
+        try
+            do! refactoringProvider.ComputeRefactoringsAsync(codeActionContext) |> Async.AwaitTask
+        with ex ->
+            logMessage (sprintf "cannot compute refactorings for %s: %s" (string refactoringProvider) (string ex))
 
     // register code fixes
     let! semanticModel = doc.GetSemanticModelAsync(ct) |> Async.AwaitTask
@@ -593,8 +968,8 @@ let getRoslynCodeActions (doc: Document) (textSpan: TextSpan): Async<CodeAction 
 
                 try
                     do! codeFixProvider.RegisterCodeFixesAsync(codeFixContext) |> Async.AwaitTask
-                with _ex ->
-                    //sprintf "error in RegisterCodeFixesAsync(): %s" (ex.ToString()) |> logMessage
+                with ex ->
+                    logMessage (sprintf "error in RegisterCodeFixesAsync(): %s" (ex.ToString()))
                     ()
 
     let unwrapRoslynCodeAction (ca: Microsoft.CodeAnalysis.CodeActions.CodeAction) =
@@ -642,23 +1017,30 @@ let tryAddDocument logMessage
     let docDir = Path.GetDirectoryName(docFilePath)
     //logMessage (sprintf "TextDocumentDidOpen: docFilename=%s docDir=%s" docFilename docDir)
 
-    let matchesPath (p: Project) =
+    let fileOnProjectDir (p: Project) =
         let projectDir = Path.GetDirectoryName(p.FilePath)
-        (docDir |> string).StartsWith(projectDir |> string)
+        let projectDirWithDirSepChar = projectDir + (string Path.DirectorySeparatorChar)
 
-    let projectOnPath = solution.Projects |> Seq.filter matchesPath |> Seq.tryHead
+        (docDir = projectDir) || docDir.StartsWith(projectDirWithDirSepChar)
+
+    let projectOnPath =
+        solution.Projects
+        |> Seq.filter fileOnProjectDir
+        |> Seq.tryHead
 
     match projectOnPath with
     | Some proj ->
         let projectBaseDir = Path.GetDirectoryName(proj.FilePath)
         let docName = docFilePath.Substring(projectBaseDir.Length+1)
 
-        //logMessage (sprintf "Adding file %s (\"%s\") to project %s" docName docFilePath proj.FilePath)
+        //logMessage (sprintf "Adding \"%s\" (\"%s\") to project %s" docName docFilePath proj.FilePath)
 
         let newDoc = proj.AddDocument(name=docName, text=SourceText.From(text), folders=null, filePath=docFilePath)
         Some newDoc
 
-    | None -> None
+    | None ->
+        logMessage (sprintf "No parent project could be resolved to add file \"%s\" to workspace" docFilePath)
+        None
 
 let processChange (oldText: SourceText) (change: TextChange) : TextEdit =
     let mapToTextEdit(linePosition: LinePositionSpan, newText: string) : TextEdit =
@@ -769,3 +1151,32 @@ let handleTextOnTypeFormatAsync (doc: Document) (ch: char) (position: Position) 
             | None -> return Array.empty<TextEdit>
         | _ -> return Array.empty<TextEdit>
     }
+
+let makeDocumentFromMetadata
+        (compilation: Microsoft.CodeAnalysis.Compilation)
+        (project: Microsoft.CodeAnalysis.Project)
+        (l: Microsoft.CodeAnalysis.Location)
+        (fullName: string) =
+    let mdLocation = l
+    let reference = compilation.GetMetadataReference(mdLocation.MetadataModule.ContainingAssembly)
+    let peReference = reference :?> PortableExecutableReference |> Option.ofObj
+    let assemblyLocation = peReference |> Option.map (fun r -> r.FilePath) |> Option.defaultValue "???"
+
+    let decompilerSettings = DecompilerSettings()
+    decompilerSettings.ThrowOnAssemblyResolveErrors <- false // this shouldn't be a showstopper for us
+
+    let decompiler = CSharpDecompiler(assemblyLocation, decompilerSettings)
+
+    // Escape invalid identifiers to prevent Roslyn from failing to parse the generated code.
+    // (This happens for example, when there is compiler-generated code that is not yet recognized/transformed by the decompiler.)
+    decompiler.AstTransforms.Add(EscapeInvalidIdentifiers())
+
+    let fullTypeName = ICSharpCode.Decompiler.TypeSystem.FullTypeName(fullName)
+
+    let text = decompiler.DecompileTypeAsString(fullTypeName)
+
+    let mdDocumentFilename = $"$metadata$/projects/{project.Name}/assemblies/{mdLocation.MetadataModule.ContainingAssembly.Name}/symbols/{fullName}.cs"
+    let mdDocumentEmpty = project.AddDocument(mdDocumentFilename, String.Empty)
+
+    let mdDocument = SourceText.From(text) |> mdDocumentEmpty.WithText
+    (mdDocument, text)

@@ -1,6 +1,5 @@
 module CSharpLanguageServer.Program
 
-open Microsoft.Build.Locator
 open Argu
 open System.Reflection
 
@@ -15,8 +14,6 @@ let entry args =
                                              (Assembly.GetExecutingAssembly().GetName().Version |> string)
                                      exit 0)
 
-        MSBuildLocator.RegisterDefaults() |> ignore
-
         let parseLogLevel (s: string) =
             match s.ToLowerInvariant() with
             | "error" -> Ionide.LanguageServerProtocol.Types.MessageType.Error
@@ -26,7 +23,7 @@ let entry args =
             | _ -> Ionide.LanguageServerProtocol.Types.MessageType.Log
 
         // default the verbosity to warning
-        let serverOptions: Server.Options = {
+        let serverOptions: State.Options = {
             SolutionPath = serverArgs.TryGetResult(<@ Options.CLIArguments.Solution @>)
             LogLevel = serverArgs.TryGetResult(<@ Options.CLIArguments.LogLevel @>)
                        |> Option.defaultValue "log"

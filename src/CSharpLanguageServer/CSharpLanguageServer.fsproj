@@ -14,40 +14,39 @@
     <PackageTags>csharp;lsp;roslyn</PackageTags>
     <PackageProjectUrl>https://github.com/razzmatazz/csharp-language-server</PackageProjectUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
-    <Version>0.4.0</Version>
-    <PackageVersion>0.4.0</PackageVersion>
+    <ChangelogFile>..\..\CHANGELOG.md</ChangelogFile>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="RoslynHelpers.fs" />
     <Compile Include="Documentation.fs" />
+    <Compile Include="State.fs" />
     <Compile Include="Server.fs" />
     <Compile Include="Options.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Ionide.LanguageServerProtocol\Ionide.LanguageServerProtocol.fsproj" />
-  </ItemGroup>
-
-  <ItemGroup>
     <PackageReference Include="Argu" Version="6.1.1" />
-    <PackageReference Include="ICSharpCode.Decompiler" Version="7.2.0.6844" />
+    <PackageReference Include="Castle.Core" Version="5.1.0" />
+    <PackageReference Include="ICSharpCode.Decompiler" Version="7.2.1.6856" />
+    <PackageReference Include="Ionide.KeepAChangelog.Tasks" Version="0.1.8" PrivateAssets="All" />
+    <PackageReference Include="Ionide.LanguageServerProtocol" Version="0.4.10" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
-    <PackageReference Include="Microsoft.Build.Locator" Version="1.4.1" />
-    <PackageReference Include="Microsoft.CodeAnalysis" Version="4.1.0">
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.5.5" />
+    <PackageReference Include="Microsoft.Build" Version="17.3.2" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.3.2" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.CodeAnalysis" Version="4.4.0-4.final">
       <NoWarn>NU1604</NoWarn>
       <NoWarn>NU1701</NoWarn>
     </PackageReference>
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.1.0">
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.4.0-4.final">
       <NoWarn>NU1604</NoWarn>
       <NoWarn>NU1701</NoWarn>
     </PackageReference>
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="4.1.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.1.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="4.1.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.1.0" />
-    <PackageReference Include="Microsoft.Build" Version="17.0.0" ExcludeAssets="runtime" />
-    <PackageReference Include="Microsoft.Build.Framework" Version="17.0.0" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="4.4.0-4.final" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.4.0-4.final" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="4.4.0-4.final" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.4.0-4.final" />
   </ItemGroup>
 </Project>

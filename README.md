@@ -7,17 +7,6 @@ to work with projects using older versions of dotnet SDK, including .NET Core 3,
 .NET Framework 4.8 and possibly older ones too as it uses the standard
 Roslyn/MSBuild libs that Visual Studio & omnisharp does.
 
-## Features
-- symbol rename;
-- go-to-definition;
-- find references;
-- document/workspace symbol search;
-- `textDocument/documentHighlight` support:
-  - highlighting other symbol references in the document on hover;
-- `codeAction/resolve` support for better performance when invoking code actions;
-- go-to-definition in metadata support:
-  - (needs integration from your LSP client -- `emacs-lsp/lsp-mode` has it.).
-
 See [CHANGELOG.md](CHANGELOG.md) for the list of recent improvements/fixes.
 
 # Installation
@@ -25,19 +14,44 @@ See [CHANGELOG.md](CHANGELOG.md) for the list of recent improvements/fixes.
 
 See [csharp-ls nuget page](https://www.nuget.org/packages/csharp-ls/)
 
+# Building
+
+## On Linux/macOS
+
+```
+$ (cd src && dotnet build)
+```
+
+# Features
+- symbol rename;
+- code refactorings from roslyn;
+- go-to-definition;
+- find references;
+- document/workspace symbol search;
+- `textDocument/documentHighlight` support:
+  - highlighting other symbol references in the document on hover;
+- `codeAction/resolve` support for better performance when invoking code actions;
+- go-to-definition in metadata support (needs integration from your LSP client).
+
 # Acknowledgements
+- csharp-ls is not affiliated with Microsoft Corp;
 - csharp-ls uses LSP interface from [Ionide.LanguageServerProtocol](https://github.com/ionide/LanguageServerProtocol);
-- csharp-ls uses Roslyn to parse and update code; Roslyn maps really nicely to LSP w/relatively little impedance mismatch;
-- csharp-ls uses [ILSpy/ICSharpCode.Decompiler](https://github.com/icsharpcode/ILSpy) to decompile types in assemblies to C# source;
-- csharp-ls is not affiliated with Microsoft Corp.
+- csharp-ls uses [Roslyn](https://github.com/dotnet/roslyn) to parse and update code; Roslyn maps really nicely to LSP w/relatively little impedance mismatch;
+- csharp-ls uses [ILSpy/ICSharpCode.Decompiler](https://github.com/icsharpcode/ILSpy) to decompile types in assemblies to C# source.
 
 # TODO list
+ - it seems push diagnostics logic we have is not very responsive when we have a lot of documents open;
+ - check we're not doing lense stuff or other funny things on metadata code (emacs-lsp/lsp-mode issue?);
+ - find-refs is blocking r/w operations, request scheduling needs smarter refactoring;
+   - should we cancel existing ones? -- where cancellable? how to know?
+ - support for pull diagnostics (lsp 3.17);
+ - support for inlay hints (lsp 3.17);
+ - go-to-def in metadata does not work for Attribute as those have Attribute suffix;
  - progress support;
- - `textDocument/signatureHelp` support for overload listing/selection
  - properly escape docxml text, e.g. backquote is a special character in markdown;
  - selection range provider
  - semantic tokens
- - ability to run tests
+ - ability to run tests / test browser support like fsac has?
  - razorls integration (server-side)
  - analyzer support
  - code generator support

@@ -1,36 +1,74 @@
 module CSharpLanguageServer.Server
 
 open System
+open System.Text
 open System.IO
 open System.Collections.Generic
 open System.Collections.Immutable
-
+open System.Diagnostics
 open Microsoft.CodeAnalysis
 open Microsoft.CodeAnalysis.FindSymbols
 open Microsoft.CodeAnalysis.Text
 open Microsoft.CodeAnalysis.Completion
 open Microsoft.CodeAnalysis.Rename
-
-open Ionide.LanguageServerProtocol.Server
-open Ionide.LanguageServerProtocol
-open Ionide.LanguageServerProtocol.Types
-open Ionide.LanguageServerProtocol.LspResult
-
-open RoslynHelpers
+open Microsoft.CodeAnalysis.CSharp.Syntax
 open Microsoft.CodeAnalysis.CodeFixes
-open ICSharpCode.Decompiler.CSharp
-open ICSharpCode.Decompiler
-open ICSharpCode.Decompiler.CSharp.Transforms
+open Microsoft.Build.Locator
 open Newtonsoft.Json
-open Newtonsoft.Json.Converters
 open Newtonsoft.Json.Linq
+open Ionide.LanguageServerProtocol
+open Ionide.LanguageServerProtocol.Server
+open Ionide.LanguageServerProtocol.Types
+open RoslynHelpers
+open State
+open System.Threading.Tasks
+open System.Threading
 
-type Options = {
-    SolutionPath: string option;
-    LogLevel: Types.MessageType;
+// TPL Task's wrap exceptions in AggregateException, -- this fn unpacks them
+let rec unpackException (exn : Exception) =
+    match exn with
+    | :? AggregateException as agg ->
+        match Seq.tryExactlyOne agg.InnerExceptions with
+        | Some x -> unpackException x
+        | None -> exn
+    | _ -> exn
+
+let runTaskWithNoneOnTimeout (timeoutMS:int) (baseCT:CancellationToken) taskFn = task {
+    use timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(baseCT)
+    timeoutCts.CancelAfter(timeoutMS)
+
+    try
+        let! taskFnResult = taskFn timeoutCts.Token
+        return Some taskFnResult
+    with
+    | ex ->
+        let unpackedEx = ex |> unpackException
+        if (unpackedEx :? TaskCanceledException) || (unpackedEx :? OperationCanceledException) then
+            return None
+        else
+            return raise ex
 }
 
-let emptyOptions = { SolutionPath = None; LogLevel = Types.MessageType.Log }
+type CSharpMetadataParams = {
+    TextDocument: TextDocumentIdentifier
+}
+
+type CSharpMetadataResponse = CSharpMetadata
+
+type CSharpCodeActionResolutionData = {
+    TextDocumentUri: string
+    Range: Range
+}
+
+type CodeLensData = { DocumentUri: string; Position: Position  }
+
+let emptyCodeLensData = { DocumentUri=""; Position={ Line=0; Character=0 } }
+
+type InvocationContext = {
+    Receiver: SyntaxNode
+    ArgumentTypes: TypeInfo list
+    Separators: SyntaxToken list
+}
 
 type CSharpLspClient(sendServerNotification: ClientNotificationSender, sendServerRequest: ClientRequestSender) =
     inherit LspClient ()
@@ -68,447 +106,35 @@ type CSharpLspClient(sendServerNotification: ClientNotificationSender, sendServe
     override __.TextDocumentPublishDiagnostics(p) =
         sendServerNotification "textDocument/publishDiagnostics" (box p) |> Async.Ignore
 
+let getDotnetCliVersion () : string =
+    use proc = new Process()
+    proc.StartInfo <- ProcessStartInfo()
+    proc.StartInfo.FileName <- "dotnet"
+    proc.StartInfo.Arguments <- "--version"
+    proc.StartInfo.UseShellExecute <- false
+    proc.StartInfo.RedirectStandardOutput <- true
+    proc.StartInfo.CreateNoWindow <- true
 
-type CSharpMetadataParams = {
-    TextDocument: TextDocumentIdentifier
-}
+    let startOK = proc.Start()
+    if startOK then
+        let sbuilder = StringBuilder()
+        while (not (proc.StandardOutput.EndOfStream)) do
+            sbuilder.Append(proc.StandardOutput.ReadLine()) |> ignore
 
-type CSharpMetadataResponse = {
-    ProjectName: string;
-    AssemblyName: string;
-    SymbolName: string;
-    Source: string;
-}
-
-type CSharpCodeActionResolutionData = {
-    TextDocumentUri: string
-    Range: Range
-}
-
-type DecompiledMetadataDocument = { Metadata: CSharpMetadataResponse; Document: Document }
-
-type ServerDocumentType =
-     | UserDocument // user Document from solution, on disk
-     | DecompiledDocument // Document decompiled from metadata, readonly
-     | AnyDocument
-
-type ServerState = {
-    ClientCapabilities: ClientCapabilities option
-    Solution: Solution option
-    OpenDocVersions: Map<string, int>
-    DecompiledMetadata: Map<string, DecompiledMetadataDocument>
-    Options: Options
-    RunningChangeRequest: AsyncReplyChannel<ServerState> option
-    ChangeRequestQueue: AsyncReplyChannel<ServerState> list
-    SolutionReloadPending: DateTime option
-}
-
-let emptyServerState = { ClientCapabilities = None
-                         Solution = None
-                         OpenDocVersions = Map.empty
-                         DecompiledMetadata = Map.empty
-                         Options = emptyOptions
-                         RunningChangeRequest = None
-                         ChangeRequestQueue = []
-                         SolutionReloadPending = None }
-
-let getDocumentOfTypeForUri state docType (u: string) =
-    let uri = Uri u
-
-    match state.Solution with
-    | Some solution ->
-        let matchingUserDocuments =
-            solution.Projects
-            |> Seq.collect (fun p -> p.Documents)
-            |> Seq.filter (fun d -> Uri("file://" + d.FilePath) = uri) |> List.ofSeq
-
-        let matchingUserDocumentMaybe =
-            match matchingUserDocuments with
-            | [d] -> Some (d, UserDocument)
-            | _ -> None
-
-        let matchingDecompiledDocumentMaybe =
-            Map.tryFind u state.DecompiledMetadata
-            |> Option.map (fun x -> (x.Document, DecompiledDocument))
-
-        match docType with
-        | UserDocument -> matchingUserDocumentMaybe
-        | DecompiledDocument -> matchingDecompiledDocumentMaybe
-        | AnyDocument -> matchingUserDocumentMaybe |> Option.orElse matchingDecompiledDocumentMaybe
-
-    | None -> None
-
-type ServerStateEvent =
-    | ClientCapabilityChange of ClientCapabilities option
-    | SolutionChange of Solution
-    | DecompiledMetadataAdd of string * DecompiledMetadataDocument
-    | OpenDocVersionAdd of string * int
-    | OpenDocVersionRemove of string
-    | GetState of AsyncReplyChannel<ServerState>
-    | StartSolutionChange of AsyncReplyChannel<ServerState>
-    | FinishSolutionChange
-    | SolutionReloadRequest
-    | SolutionReload
-    | PeriodicTimerTick
-
-let makeDocumentFromMetadata
-        (compilation: Microsoft.CodeAnalysis.Compilation)
-        (project: Microsoft.CodeAnalysis.Project)
-        (l: Microsoft.CodeAnalysis.Location)
-        (fullName: string) =
-    let mdLocation = l
-    let reference = compilation.GetMetadataReference(mdLocation.MetadataModule.ContainingAssembly)
-    let peReference = reference :?> PortableExecutableReference |> Option.ofObj
-    let assemblyLocation = peReference |> Option.map (fun r -> r.FilePath) |> Option.defaultValue "???"
-
-    let decompiler = CSharpDecompiler(assemblyLocation, DecompilerSettings())
-
-    // Escape invalid identifiers to prevent Roslyn from failing to parse the generated code.
-    // (This happens for example, when there is compiler-generated code that is not yet recognized/transformed by the decompiler.)
-    decompiler.AstTransforms.Add(EscapeInvalidIdentifiers())
-
-    let fullTypeName = ICSharpCode.Decompiler.TypeSystem.FullTypeName(fullName)
-
-    let text = decompiler.DecompileTypeAsString(fullTypeName)
-
-    let mdDocumentFilename = $"$metadata$/projects/{project.Name}/assemblies/{mdLocation.MetadataModule.ContainingAssembly.Name}/symbols/{fullName}.cs"
-    let mdDocumentEmpty = project.AddDocument(mdDocumentFilename, String.Empty)
-
-    let mdDocument = SourceText.From(text) |> mdDocumentEmpty.WithText
-    (mdDocument, text)
-
-let resolveSymbolLocation
-        (state: ServerState)
-        (compilation: Microsoft.CodeAnalysis.Compilation)
-        (project: Microsoft.CodeAnalysis.Project)
-        sym
-        (l: Microsoft.CodeAnalysis.Location) = async {
-
-    let! ct = Async.CancellationToken
-
-    if l.IsInMetadata then
-        let fullName = sym |> getContainingTypeOrThis |> getFullReflectionName
-        let uri = $"csharp:/metadata/projects/{project.Name}/assemblies/{l.MetadataModule.ContainingAssembly.Name}/symbols/{fullName}.cs"
-
-        let mdDocument, stateChanges =
-            match Map.tryFind uri state.DecompiledMetadata with
-            | Some value ->
-                (value.Document, [])
-            | None ->
-                let (documentFromMd, text) = makeDocumentFromMetadata compilation project l fullName
-
-                let csharpMetadata = { ProjectName = project.Name
-                                       AssemblyName = l.MetadataModule.ContainingAssembly.Name
-                                       SymbolName = fullName
-                                       Source = text }
-                (documentFromMd, [
-                     DecompiledMetadataAdd (uri, { Metadata = csharpMetadata; Document = documentFromMd })])
-
-        // figure out location on the document (approx implementation)
-        let! syntaxTree = mdDocument.GetSyntaxTreeAsync(ct) |> Async.AwaitTask
-        let collector = DocumentSymbolCollectorForMatchingSymbolName(uri, sym.Name)
-        collector.Visit(syntaxTree.GetRoot())
-
-        let fallbackLocationInMetadata = {
-            Uri = uri
-            Range = { Start = { Line = 0; Character = 0 }; End = { Line = 0; Character = 1 } } }
-
-        let resolved =
-            match collector.GetLocations() with
-            | [] -> [fallbackLocationInMetadata]
-            | ls -> ls
-
-        return resolved, stateChanges
-
-    else if l.IsInSource then
-        let resolved = [lspLocationForRoslynLocation l]
-
-        return resolved, []
+        sbuilder.ToString()
     else
-        return [], []
-}
+        "(could not launch `dotnet --version`)"
 
-let resolveSymbolLocations
-        (state: ServerState)
-        (project: Microsoft.CodeAnalysis.Project)
-        (symbols: Microsoft.CodeAnalysis.ISymbol list) = async {
-    let! ct = Async.CancellationToken
-    let! compilation = project.GetCompilationAsync(ct) |> Async.AwaitTask
-
-    let mutable aggregatedLspLocations = []
-    let mutable aggregatedStateChanges = []
-
-    for sym in symbols do
-        for l in sym.Locations do
-            let! (symLspLocations, stateChanges) =
-                resolveSymbolLocation state compilation project sym l
-
-            aggregatedLspLocations <- aggregatedLspLocations @ symLspLocations
-            aggregatedStateChanges <- aggregatedStateChanges @ stateChanges
-
-    return (aggregatedLspLocations, aggregatedStateChanges)
-}
-
-type CodeLensData = { DocumentUri: string; Position: Position  }
-
-let emptyCodeLensData = { DocumentUri=""; Position={ Line=0; Character=0 } }
-
-let rec processServerEvent logMessage state msg: Async<ServerState> = async {
-    let! ct = Async.CancellationToken
-    match msg with
-    | GetState replyChannel ->
-        replyChannel.Reply(state)
-        return state
-
-    | StartSolutionChange replyChannel ->
-        // only reply if we don't have another request that would change solution;
-        // otherwise enqueue the `replyChannel` to the ChangeRequestQueue
-        match state.RunningChangeRequest with
-        | Some _req ->
-            return { state with
-                         ChangeRequestQueue = state.ChangeRequestQueue @ [replyChannel] }
-        | None ->
-            replyChannel.Reply(state)
-            return { state with
-                         RunningChangeRequest = Some replyChannel }
-
-    | FinishSolutionChange ->
-        let newState = { state with RunningChangeRequest = None }
-
-        return match state.ChangeRequestQueue with
-               | [] -> newState
-               | nextPendingRequest :: queueRemainder ->
-                    nextPendingRequest.Reply(newState)
-                    { newState with
-                          ChangeRequestQueue = queueRemainder
-                          RunningChangeRequest = Some nextPendingRequest }
-
-    | ClientCapabilityChange cc ->
-        return { state with ClientCapabilities = cc }
-
-    | SolutionChange s ->
-        return { state with Solution = Some s }
-
-    | DecompiledMetadataAdd (uri, md) ->
-        let newDecompiledMd = Map.add uri md state.DecompiledMetadata
-        return { state with DecompiledMetadata = newDecompiledMd }
-
-    | OpenDocVersionAdd (doc, ver) ->
-        let newOpenDocVersions = Map.add doc ver state.OpenDocVersions
-        return { state with OpenDocVersions = newOpenDocVersions }
-
-    | OpenDocVersionRemove uri ->
-        let newOpenDocVersions = state.OpenDocVersions |> Map.remove uri
-        return { state with OpenDocVersions = newOpenDocVersions }
-
-    | SolutionReloadRequest ->
-        // we need to wait a bit before starting this so we
-        // can buffer many incoming requests at once
-        return { state with SolutionReloadPending = DateTime.Now.AddSeconds(3) |> Some }
-
-    | SolutionReload ->
-        let! solution =
-            match state.Options.SolutionPath with
-            | Some solutionPath -> async {
-                logMessage (sprintf "loading specified solution file: %s.." solutionPath)
-                return! tryLoadSolutionOnPath logMessage solutionPath
-              }
-
-            | None -> async {
-                let cwd = Directory.GetCurrentDirectory()
-                logMessage (sprintf "attempting to find and load solution based on cwd: \"%s\".." cwd)
-                return! findAndLoadSolutionOnDir logMessage cwd
-              }
-
-        return { state with Solution = solution }
-
-    | PeriodicTimerTick ->
-        let solutionReloadTime = state.SolutionReloadPending
-                                 |> Option.defaultValue (DateTime.Now.AddDays(1))
-
-        match solutionReloadTime < DateTime.Now with
-        | true ->
-            let! newState = processServerEvent logMessage state SolutionReload
-
-            return { newState with SolutionReloadPending = None }
-
-        | false ->
-            return state
-}
-
-let serverEventLoop logMessage initialState (inbox: MailboxProcessor<ServerStateEvent>) =
-    let rec loop state = async {
-        let! msg = inbox.Receive()
-        let! newState = msg |> processServerEvent logMessage state
-        return! loop newState
-    }
-
-    loop initialState
-
-type ServerRequestScope (state: ServerState, emitServerEvent, onDispose: unit -> unit) =
-    let mutable solutionMaybe = state.Solution
-
-    interface IDisposable with
-        member _.Dispose() = onDispose()
-
-    member _.State = state
-    member _.ClientCapabilities = state.ClientCapabilities
-    member _.Solution = solutionMaybe.Value
-    member _.OpenDocVersions = state.OpenDocVersions
-    member _.DecompiledMetadata = state.DecompiledMetadata
-
-    member this.GetDocumentForUriOfType docType (u: string) =
-        let uri = Uri u
-
-        match solutionMaybe with
-        | Some solution ->
-            let matchingUserDocuments =
-                solution.Projects
-                |> Seq.collect (fun p -> p.Documents)
-                |> Seq.filter (fun d -> Uri("file://" + d.FilePath) = uri) |> List.ofSeq
-
-            let matchingUserDocumentMaybe =
-                match matchingUserDocuments with
-                | [d] -> Some (d, UserDocument)
-                | _ -> None
-
-            let matchingDecompiledDocumentMaybe =
-                Map.tryFind u this.DecompiledMetadata
-                |> Option.map (fun x -> (x.Document, DecompiledDocument))
-
-            match docType with
-            | UserDocument -> matchingUserDocumentMaybe
-            | DecompiledDocument -> matchingDecompiledDocumentMaybe
-            | AnyDocument -> matchingUserDocumentMaybe |> Option.orElse matchingDecompiledDocumentMaybe
-        | None -> None
-
-    member x.GetUserDocumentForUri (u: string) = x.GetDocumentForUriOfType UserDocument u |> Option.map fst
-    member x.GetAnyDocumentForUri (u: string) = x.GetDocumentForUriOfType AnyDocument u |> Option.map fst
-
-    member x.GetSymbolAtPositionOfType docType uri pos = async {
-        match x.GetDocumentForUriOfType docType uri with
-        | Some (doc, _docType) ->
-            let! ct = Async.CancellationToken
-            let! sourceText = doc.GetTextAsync(ct) |> Async.AwaitTask
-            let position = sourceText.Lines.GetPosition(LinePosition(pos.Line, pos.Character))
-            let! symbolRef = SymbolFinder.FindSymbolAtPositionAsync(doc, position, ct) |> Async.AwaitTask
-            return if isNull symbolRef then None else Some (symbolRef, doc, position)
-
-        | None ->
-            return None
-    }
-
-    member x.GetSymbolAtPositionOnAnyDocument uri pos = x.GetSymbolAtPositionOfType AnyDocument uri pos
-    member x.GetSymbolAtPositionOnUserDocument uri pos = x.GetSymbolAtPositionOfType UserDocument uri pos
-
-    member x.Emit ev =
-        match ev with
-        | SolutionChange newSolution ->
-            solutionMaybe <- Some newSolution
-        | _ -> ()
-
-        emitServerEvent ev
-
-    member x.EmitMany es = for e in es do x.Emit e
-
-type DiagnosticsEvent =
-    | DocumentOpenOrChange of string * DateTime
-    | DocumentClose of string
-    | ProcessPendingDiagnostics
-    | DocumentBacklogUpdate
-    | DocumentRemoval of string
-
-type DiagnosticsState = {
-    DocumentBacklog: string list
-    DocumentChanges: Map<string, DateTime>
-}
-
-let emptyDiagnosticsState = { DocumentBacklog = []; DocumentChanges = Map.empty }
-
-let processDiagnosticsEvent logMessage
-                            (lspClient: CSharpLspClient)
-                            (getDocumentForUri: string -> Async<(Document * ServerDocumentType) option>)
-                            (state: DiagnosticsState)
-                            event =
-    match event with
-    | DocumentRemoval uri -> async {
-        let updatedDocumentChanges = state.DocumentChanges |> Map.remove uri
-        let newState = { state with DocumentChanges = updatedDocumentChanges }
-        return newState, [ DocumentBacklogUpdate ]
-      }
-
-    | DocumentOpenOrChange (uri, timestamp) -> async {
-        let newDocChanges = state.DocumentChanges |> Map.add uri timestamp
-        let newState = { state with DocumentChanges = newDocChanges }
-        return newState, [ DocumentBacklogUpdate ]
-      }
-
-    | DocumentBacklogUpdate -> async {
-        let newBacklog =
-            state.DocumentChanges
-            |> Seq.sortByDescending (fun kv -> kv.Value)
-            |> Seq.map (fun kv -> kv.Key)
-            |> List.ofSeq
-
-        let newState = { state with DocumentBacklog = newBacklog }
-        return newState, []
-      }
-
-    | DocumentClose uri -> async {
-        let prunedBacklog = state.DocumentBacklog
-                            |> Seq.filter (fun x -> x <> uri)
-                            |> List.ofSeq
-
-        let prunedDocumentChanges = state.DocumentChanges |> Map.remove uri
-
-        let newState = { state with DocumentBacklog = prunedBacklog
-                                    DocumentChanges = prunedDocumentChanges }
-        return newState, []
-      }
-
-    | ProcessPendingDiagnostics -> async {
-        let docUriMaybe, newBacklog =
-            match state.DocumentBacklog with
-            | [] -> (None, [])
-            | uri :: remainder -> (Some uri, remainder)
-
-        match docUriMaybe with
-        | Some docUri ->
-            let! docAndTypeMaybe = getDocumentForUri docUri
-            match docAndTypeMaybe with
-            | Some (doc, _) ->
-                let! ct = Async.CancellationToken
-                let! semanticModelMaybe = doc.GetSemanticModelAsync(ct) |> Async.AwaitTask
-                match semanticModelMaybe |> Option.ofObj with
-                | Some semanticModel ->
-                    let diagnostics =
-                        semanticModel.GetDiagnostics()
-                        |> Seq.map RoslynHelpers.roslynToLspDiagnostic
-                        |> Array.ofSeq
-
-                    do! lspClient.TextDocumentPublishDiagnostics { Uri = docUri; Diagnostics = diagnostics }
-                | None -> ()
-            | None -> ()
-        | None -> ()
-
-        let eventsToPost = match newBacklog with
-                           | [] -> []
-                           | _ -> [ ProcessPendingDiagnostics ]
-
-        return { state with DocumentBacklog = newBacklog }, eventsToPost
-      }
-
-let setupServerHandlers options lspClient =
+let setupServerHandlers options (lspClient: LspClient) =
+    let success = LspResult.success
     let mutable logMessageCurrent = Action<string>(fun _ -> ())
     let logMessageInvoke m = logMessageCurrent.Invoke(m)
 
     let stateActor = MailboxProcessor.Start(
         serverEventLoop logMessageInvoke { emptyServerState with Options = options })
 
-    let getDocumentForUriFromCurrentState docType uri = async {
-        let! state = stateActor.PostAndAsyncReply(GetState)
-        return getDocumentOfTypeForUri state docType uri
-    }
+    let getDocumentForUriFromCurrentState docType uri =
+        stateActor.PostAndAsyncReply(fun rc -> GetDocumentOfTypeForUri (docType, uri, rc))
 
     let diagnostics = MailboxProcessor.Start(
         fun inbox -> async {
@@ -517,7 +143,7 @@ let setupServerHandlers options lspClient =
                     let! msg = inbox.Receive()
                     let! (newState, eventsToPost) =
                         processDiagnosticsEvent logMessageInvoke
-                                                lspClient
+                                                (fun docUri diagnostics -> lspClient.TextDocumentPublishDiagnostics { Uri = docUri; Diagnostics = diagnostics })
                                                 (getDocumentForUriFromCurrentState AnyDocument)
                                                 state
                                                 msg
@@ -548,50 +174,51 @@ let setupServerHandlers options lspClient =
 
     let logMessage = logMessageWithLevel MessageType.Log
     let infoMessage = logMessageWithLevel MessageType.Info
-    let warningMessage = logMessageWithLevel MessageType.Warning
-    let errorMessage = logMessageWithLevel MessageType.Error
+    //let warningMessage = logMessageWithLevel MessageType.Warning
+    //let errorMessage = logMessageWithLevel MessageType.Error
 
     let handleInitialize (scope: ServerRequestScope) (p: InitializeParams): AsyncLspResult<InitializeResult> =
-      async {
-        logMessageCurrent <- Action<string>(logMessage)
+      logMessageCurrent <- Action<string>(logMessage)
 
-        infoMessage (sprintf "initializing, csharp-ls version %s; options are: %s"
+      infoMessage (sprintf "initializing, csharp-ls version %s; options are: %s"
                             (typeof<CSharpLspClient>.Assembly.GetName().Version |> string)
-                            (options |> serialize |> string))
+                            (JsonConvert.SerializeObject(options)))
 
-        infoMessage "csharp-ls is released under MIT license and is not affiliated with Microsoft Corp.; see https://github.com/razzmatazz/csharp-language-server"
+      infoMessage "csharp-ls is released under MIT license and is not affiliated with Microsoft Corp.; see https://github.com/razzmatazz/csharp-language-server"
 
-        scope.Emit(ClientCapabilityChange p.Capabilities)
+      infoMessage (sprintf "`dotnet --version`: %s"
+                           (getDotnetCliVersion ()))
 
-        // registering w/client for didChangeWatchedFiles notifications"
-        let fileChangeWatcher = { GlobPattern = "**/*.{cs,csproj,sln}"
-                                  Kind = None }
+      let vsInstance = MSBuildLocator.RegisterDefaults()
 
-        let didChangeWatchedFilesRegistration: Types.Registration =
-            { Id = "id:workspace/didChangeWatchedFiles"
-              Method = "workspace/didChangeWatchedFiles"
-              RegisterOptions = { Watchers = [| fileChangeWatcher |] } |> serialize |> Some
-            }
+      infoMessage (sprintf "MSBuildLocator: SDK=\"%s\", Version=%s, MSBuildPath=\"%s\", DiscoveryType=%s"
+                           vsInstance.Name
+                           (string vsInstance.Version)
+                           vsInstance.MSBuildPath
+                           (string vsInstance.DiscoveryType))
 
-        let! regResult = lspClient.ClientRegisterCapability(
-            { Registrations = [| didChangeWatchedFilesRegistration |] })
+      scope.Emit(ClientCapabilityChange p.Capabilities)
 
-        match regResult with
-        | Ok _ -> ()
-        | Error error -> infoMessage (sprintf "  ...didChangeWatchedFiles registration has failed with %s" (error |> string))
+      // setup timer so actors get period ticks
+      setupTimer ()
 
-        // setup timer so actors get period ticks
-        setupTimer ()
+      let clientSupportsRenameOptions =
+          p.Capabilities
+          |> Option.bind (fun x -> x.TextDocument)
+          |> Option.bind (fun x -> x.Rename)
+          |> Option.bind (fun x -> x.PrepareSupport)
+          |> Option.defaultValue false
 
-        // start solution loading (on stateActor)
-        scope.Emit(SolutionReload)
-
-        return success {
+      let initializeResult = {
               InitializeResult.Default with
                 Capabilities =
                     { ServerCapabilities.Default with
                         HoverProvider = Some true
-                        RenameProvider = Some true
+                        RenameProvider =
+                               if clientSupportsRenameOptions then
+                                   Second { PrepareProvider = Some true } |> Some
+                               else
+                                   true |> First |> Some
                         DefinitionProvider = Some true
                         TypeDefinitionProvider = None
                         ImplementationProvider = Some true
@@ -605,7 +232,9 @@ let setupServerHandlers options lspClient =
                                Some
                                     { FirstTriggerCharacter = ';'
                                       MoreTriggerCharacter = Some([| '}'; ')' |]) }
-                        SignatureHelpProvider = None
+                        SignatureHelpProvider =
+                            Some { TriggerCharacters = Some([| '('; ','; '<'; '{'; '[' |])
+                                   RetriggerCharacters = None }
                         CompletionProvider =
                             Some { ResolveProvider = None
                                    TriggerCharacters = Some ([| '.'; '''; |])
@@ -619,7 +248,7 @@ let setupServerHandlers options lspClient =
                                  }
                         TextDocumentSync =
                             Some { TextDocumentSyncOptions.Default with
-                                     OpenClose = None
+                                     OpenClose = Some true
                                      Save = Some { IncludeText = Some true }
                                      Change = Some TextDocumentSyncKind.Incremental
                                  }
@@ -627,10 +256,41 @@ let setupServerHandlers options lspClient =
                         SelectionRangeProvider = None
                         SemanticTokensProvider = None
                     }
-            }
-    }
+              }
 
-    let handleTextDocumentDidOpen (scope: ServerRequestScope) (openParams: Types.DidOpenTextDocumentParams): Async<unit> =
+      async {
+          // load solution (on stateActor)
+          do! stateActor.PostAndAsyncReply(SolutionReloadInSync)
+
+          return initializeResult |> success
+      }
+
+    let handleInitialized (_scope: ServerRequestScope) (_p: InitializedParams): Async<LspResult<unit>> =
+        logMessage "\"initialized\" notification received from client"
+        async {
+            //
+            // registering w/client for didChangeWatchedFiles notifications"
+            //
+            let fileChangeWatcher = { GlobPattern = "**/*.{cs,csproj,sln}"
+                                      Kind = None }
+
+            let didChangeWatchedFilesRegistration: Types.Registration =
+                { Id = "id:workspace/didChangeWatchedFiles"
+                  Method = "workspace/didChangeWatchedFiles"
+                  RegisterOptions = { Watchers = [| fileChangeWatcher |] } |> serialize |> Some
+                }
+
+            let! regResult = lspClient.ClientRegisterCapability(
+                { Registrations = [| didChangeWatchedFilesRegistration |] })
+
+            match regResult with
+            | Ok _ -> ()
+            | Error error -> infoMessage (sprintf "  ...didChangeWatchedFiles registration has failed with %s" (error |> string))
+
+            return LspResult.Ok()
+        }
+
+    let handleTextDocumentDidOpen (scope: ServerRequestScope) (openParams: Types.DidOpenTextDocumentParams): Async<LspResult<unit>> =
       async {
         match scope.GetDocumentForUriOfType AnyDocument openParams.TextDocument.Uri with
         | Some (doc, docType) ->
@@ -653,9 +313,9 @@ let setupServerHandlers options lspClient =
                 // ok, this document is not on solution, register a new one
                 let docFilePath = openParams.TextDocument.Uri.Substring("file://".Length)
                 let newDocMaybe = tryAddDocument logMessage
-                                                docFilePath
-                                                openParams.TextDocument.Text
-                                                scope.Solution
+                                                 docFilePath
+                                                 openParams.TextDocument.Text
+                                                 scope.Solution
                 match newDocMaybe with
                 | Some newDoc ->
                     scope.Emit(SolutionChange newDoc.Project.Solution)
@@ -665,9 +325,11 @@ let setupServerHandlers options lspClient =
 
                 | None -> ()
             | false -> ()
+
+        return LspResult.Ok()
     }
 
-    let handleTextDocumentDidChange (scope: ServerRequestScope) (changeParams: Types.DidChangeTextDocumentParams): Async<unit> =
+    let handleTextDocumentDidChange (scope: ServerRequestScope) (changeParams: Types.DidChangeTextDocumentParams): Async<LspResult<unit>> =
       async {
         let docMaybe = scope.GetUserDocumentForUri changeParams.TextDocument.Uri
         match docMaybe with
@@ -691,9 +353,11 @@ let setupServerHandlers options lspClient =
                     DocumentOpenOrChange (changeParams.TextDocument.Uri, DateTime.Now))
 
         | None -> ()
+
+        return Result.Ok()
     }
 
-    let handleTextDocumentDidSave (scope: ServerRequestScope) (saveParams: Types.DidSaveTextDocumentParams): Async<unit> =
+    let handleTextDocumentDidSave (scope: ServerRequestScope) (saveParams: Types.DidSaveTextDocumentParams): Async<LspResult<unit>> =
       async {
         // we need to add this file to solution if not already
         let doc = scope.GetAnyDocumentForUri saveParams.TextDocument.Uri
@@ -714,12 +378,14 @@ let setupServerHandlers options lspClient =
                     DocumentOpenOrChange (saveParams.TextDocument.Uri, DateTime.Now))
 
             | None -> ()
+
+        return LspResult.Ok()
     }
 
-    let handleTextDocumentDidClose (scope: ServerRequestScope) (closeParams: Types.DidCloseTextDocumentParams): Async<unit> =
+    let handleTextDocumentDidClose (scope: ServerRequestScope) (closeParams: Types.DidCloseTextDocumentParams): Async<LspResult<unit>> =
         scope.Emit(OpenDocVersionRemove closeParams.TextDocument.Uri)
         diagnostics.Post(DocumentClose closeParams.TextDocument.Uri)
-        async.Return ()
+        LspResult.Ok() |> async.Return
 
     let handleTextDocumentCodeAction (scope: ServerRequestScope) (actionParams: Types.CodeActionParams): AsyncLspResult<Types.TextDocumentCodeActionResult option> = async {
         let docMaybe = scope.GetUserDocumentForUri actionParams.TextDocument.Uri
@@ -731,20 +397,21 @@ let setupServerHandlers options lspClient =
             let! ct = Async.CancellationToken
             let! docText = doc.GetTextAsync(ct) |> Async.AwaitTask
 
-            let textSpan = actionParams.Range
-                                          |> roslynLinePositionSpanForLspRange
-                                          |> docText.Lines.GetTextSpan
+            let textSpan =
+                actionParams.Range
+                |> roslynLinePositionSpanForLspRange
+                |> docText.Lines.GetTextSpan
 
-            let! roslynCodeActions = getRoslynCodeActions doc textSpan
+            let! roslynCodeActions =
+                getRoslynCodeActions logMessage doc textSpan
 
-            let clientCapabilities = scope.ClientCapabilities
             let clientSupportsCodeActionEditResolveWithEditAndData =
-                clientCapabilities.IsSome
-                && (clientCapabilities.Value.TextDocument.IsSome)
-                && (clientCapabilities.Value.TextDocument.Value.CodeAction.IsSome)
-                && (clientCapabilities.Value.TextDocument.Value.CodeAction.Value.DataSupport = Some true)
-                && (clientCapabilities.Value.TextDocument.Value.CodeAction.Value.ResolveSupport.IsSome)
-                && (clientCapabilities.Value.TextDocument.Value.CodeAction.Value.ResolveSupport.Value.Properties |> Array.contains "edit")
+                scope.ClientCapabilities
+                |> Option.bind (fun x -> x.TextDocument)
+                |> Option.bind (fun x -> x.CodeAction)
+                |> Option.bind (fun x -> x.ResolveSupport)
+                |> Option.map (fun resolveSupport -> resolveSupport.Properties |> Array.contains "edit")
+                |> Option.defaultValue false
 
             let! lspCodeActions =
                 match clientSupportsCodeActionEditResolveWithEditAndData with
@@ -754,10 +421,8 @@ let setupServerHandlers options lspClient =
                             { TextDocumentUri = actionParams.TextDocument.Uri
                               Range = actionParams.Range }
 
-                        let caData = JsonConvert.SerializeObject(resolutionData)
-
                         let lspCa = roslynCodeActionToUnresolvedLspCodeAction ca
-                        { lspCa with Data = Some (caData :> obj) }
+                        { lspCa with Data = resolutionData |> serialize |> Some }
 
                     return roslynCodeActions |> Seq.map toUnresolvedLspCodeAction |> Array.ofSeq
                   }
@@ -783,8 +448,8 @@ let setupServerHandlers options lspClient =
             return
                lspCodeActions
                |> Seq.sortByDescending (fun ca -> ca.IsPreferred)
+               |> Seq.map U2<Command, CodeAction>.Second
                |> Array.ofSeq
-               |> TextDocumentCodeActionResult.CodeActions
                |> Some
                |> success
     }
@@ -792,10 +457,10 @@ let setupServerHandlers options lspClient =
     let handleCodeActionResolve (scope: ServerRequestScope) (codeAction: CodeAction): AsyncLspResult<CodeAction option> = async {
         let resolutionData =
             codeAction.Data
-            |> Option.map (fun x -> x :?> string)
-            |> Option.map JsonConvert.DeserializeObject<CSharpCodeActionResolutionData>
+            |> Option.map deserialize<CSharpCodeActionResolutionData>
 
         let docMaybe = scope.GetUserDocumentForUri resolutionData.Value.TextDocumentUri
+
         match docMaybe with
         | None ->
             return None |> success
@@ -809,7 +474,8 @@ let setupServerHandlers options lspClient =
                        |> roslynLinePositionSpanForLspRange
                        |> docText.Lines.GetTextSpan
 
-            let! roslynCodeActions = getRoslynCodeActions doc textSpan
+            let! roslynCodeActions =
+                getRoslynCodeActions logMessage doc textSpan
 
             let selectedCodeAction = roslynCodeActions |> Seq.tryFind (fun ca -> ca.Title = codeAction.Title)
 
@@ -822,7 +488,12 @@ let setupServerHandlers options lspClient =
 
             let! maybeLspCodeAction =
                 match selectedCodeAction with
-                | Some ca -> async { return! toResolvedLspCodeAction ca }
+                | Some ca -> async {
+                    let! resolvedCA = toResolvedLspCodeAction ca
+                    if resolvedCA.IsNone then
+                       logMessage (sprintf "handleCodeActionResolve: could not resolve %s - null" (string ca))
+                    return resolvedCA
+                  }
                 | None -> async { return None }
 
             return maybeLspCodeAction |> success
@@ -860,7 +531,12 @@ let setupServerHandlers options lspClient =
             return None |> success
     }
 
-    let handleCodeLensResolve (scope: ServerRequestScope) (codeLens: CodeLens) : AsyncLspResult<CodeLens> = async {
+    let handleCodeLensResolve
+            (scope: ServerRequestScope)
+            (codeLens: CodeLens)
+            : AsyncLspResult<CodeLens> = async {
+
+        let! ct = Async.CancellationToken
         let lensData =
             codeLens.Data
             |> Option.map (fun t -> t.ToObject<CodeLensData>())
@@ -869,7 +545,6 @@ let setupServerHandlers options lspClient =
         let docMaybe = scope.GetAnyDocumentForUri lensData.DocumentUri
         let doc = docMaybe.Value
 
-        let! ct = Async.CancellationToken
         let! sourceText = doc.GetTextAsync(ct) |> Async.AwaitTask
 
         let position =
@@ -878,15 +553,23 @@ let setupServerHandlers options lspClient =
 
         let! symbol = SymbolFinder.FindSymbolAtPositionAsync(doc, position, ct) |> Async.AwaitTask
 
-        let! refs = SymbolFinder.FindReferencesAsync(symbol, doc.Project.Solution, ct) |> Async.AwaitTask
+        let resolveLocations (ct: CancellationToken) =
+            task {
+                let! refs = SymbolFinder.FindReferencesAsync(symbol, doc.Project.Solution, ct)
+                return refs |> Seq.collect (fun r -> r.Locations)
+            }
 
-        let locations = refs |> Seq.collect (fun r -> r.Locations)
+        let! locationsMaybe =
+            runTaskWithNoneOnTimeout 3000 ct resolveLocations
+            |> Async.AwaitTask
 
-        let formattedRefCount =
-            locations |> Seq.length |> sprintf "%d Reference(s)"
+        let title =
+            match locationsMaybe with
+            | Some locations -> locations |> Seq.length |> sprintf "%d Reference(s)"
+            | None -> "" // timeout
 
         let command =
-            { Title = formattedRefCount
+            { Title = title
               Command = "csharp.showReferences"
               Arguments = None // TODO: we really want to pass some more info to the client
             }
@@ -910,9 +593,8 @@ let setupServerHandlers options lspClient =
                     | Some sym -> [sym]
                     | None -> []
 
-                let! (locations, stateChanges) = resolveSymbolLocations scope.State doc.Project symbols
-
-                do scope.EmitMany stateChanges
+                let! locations =
+                     scope.ResolveSymbolLocations doc.Project symbols
 
                 return locations |> Array.ofSeq |> GotoResult.Multiple |> Some |> success
               }
@@ -943,9 +625,8 @@ let setupServerHandlers options lspClient =
                     | None -> return []
                 }
 
-                let! (locations, stateChanges) = resolveSymbolLocations scope.State doc.Project symbols
-
-                do scope.EmitMany stateChanges
+                let! locations =
+                    scope.ResolveSymbolLocations doc.Project symbols
 
                 return locations |> Array.ofSeq |> GotoResult.Multiple |> Some |> success
               }
@@ -967,21 +648,30 @@ let setupServerHandlers options lspClient =
             if isNull completionService then
                 return ()
 
-            let! maybeCompletionResults = completionService.GetCompletionsAsync(doc, posInText)
-                                            |> Async.AwaitTask
+            let! maybeCompletionResults =
+                completionService.GetCompletionsAsync(doc, posInText) |> Async.AwaitTask
 
             match Option.ofObj maybeCompletionResults with
             | Some completionResults ->
                 let makeLspCompletionItem (item: Microsoft.CodeAnalysis.Completion.CompletionItem) =
-                    { CompletionItem.Create(item.DisplayText) with
-                        Kind = item.Tags |> Seq.head |> roslynTagToLspCompletion |> Some ;
-                        InsertTextFormat = Some Types.InsertTextFormat.PlainText }
+                    let baseCompletionItem = CompletionItem.Create(item.DisplayText)
+
+                    { baseCompletionItem with
+                        Kind             = item.Tags |> Seq.head |> roslynTagToLspCompletion |> Some
+                        SortText         = item.SortText |> Option.ofObj
+                        FilterText       = item.FilterText |> Option.ofObj
+                        InsertTextFormat = Some Types.InsertTextFormat.PlainText
+                    }
+
+                let completionItems =
+                    completionResults.ItemsList
+                    |> Seq.map makeLspCompletionItem
+                    |> Array.ofSeq
 
                 let completionList = {
-                    IsIncomplete = false ;
-                    Items = completionResults.Items
-                                                |> Seq.map makeLspCompletionItem
-                                                |> Array.ofSeq }
+                    IsIncomplete = false
+                    Items        = completionItems
+                }
 
                 return success (Some completionList)
             | None -> return success None
@@ -1027,56 +717,35 @@ let setupServerHandlers options lspClient =
         | None -> return None |> success
     }
 
-    let handleTextDocumentDocumentSymbol (scope: ServerRequestScope) (p: Types.DocumentSymbolParams): AsyncLspResult<Types.SymbolInformation [] option> = async {
+    let handleTextDocumentDocumentSymbol (scope: ServerRequestScope) (p: Types.DocumentSymbolParams): AsyncLspResult<Types.DocumentSymbol [] option> = async {
+        let canEmitDocSymbolHierarchy =
+            scope.ClientCapabilities
+            |> Option.bind (fun cc -> cc.TextDocument)
+            |> Option.bind (fun cc -> cc.DocumentSymbol)
+            |> Option.bind (fun cc -> cc.HierarchicalDocumentSymbolSupport)
+            |> Option.defaultValue false
+
         let docMaybe = scope.GetAnyDocumentForUri p.TextDocument.Uri
         match docMaybe with
         | Some doc ->
             let! ct = Async.CancellationToken
             let! semanticModel = doc.GetSemanticModelAsync(ct) |> Async.AwaitTask
-            let showAttributes = false
-            let collector = DocumentSymbolCollector(p.TextDocument.Uri, semanticModel, showAttributes)
-
+            let! docText = doc.GetTextAsync(ct) |> Async.AwaitTask
             let! syntaxTree = doc.GetSyntaxTreeAsync(ct) |> Async.AwaitTask
+
+            let collector = DocumentSymbolCollector(docText, semanticModel)
+            collector.Init(doc.Name)
             collector.Visit(syntaxTree.GetRoot())
 
-            return collector.GetSymbols() |> Some |> success
+            return collector.GetDocumentSymbols(canEmitDocSymbolHierarchy)
+                   |> Some
+                   |> success
 
         | None ->
             return None |> success
     }
 
     let handleTextDocumentHover (scope: ServerRequestScope) (hoverPos: Types.TextDocumentPositionParams): AsyncLspResult<Types.Hover option> = async {
-        let csharpMarkdownDocForSymbol (sym: ISymbol) (semanticModel: SemanticModel) pos =
-            let symbolInfo = symbolToLspSymbolInformation true sym (Some semanticModel) (Some pos)
-
-            let symAssemblyName =
-                sym.ContainingAssembly
-               |> Option.ofObj
-                |> Option.map (fun a -> a.Name)
-                |> Option.defaultValue ""
-
-            let symbolInfoLines =
-                match symbolInfo.Name, symAssemblyName with
-                | "", "" -> []
-                | typeName, "" -> [sprintf "`%s`" typeName]
-                | _, _ ->
-                    let docAssembly = semanticModel.Compilation.Assembly
-                    if symAssemblyName = docAssembly.Name then
-                        [sprintf "`%s`" symbolInfo.Name]
-                    else
-                        [sprintf "`%s` from assembly `%s`" symbolInfo.Name symAssemblyName]
-
-            let comment = Documentation.parseComment (sym.GetDocumentationCommentXml())
-            let formattedDocLines = Documentation.formatComment comment
-
-            let formattedDoc =
-                formattedDocLines
-                |> Seq.append (if symbolInfoLines.Length > 0 && formattedDocLines.Length > 0 then [""] else [])
-                |> Seq.append symbolInfoLines
-                |> (fun ss -> String.Join("\n", ss))
-
-            [MarkedString.WithLanguage { Language = "markdown"; Value = formattedDoc }]
-
         let! maybeSymbol = scope.GetSymbolAtPositionOnAnyDocument hoverPos.TextDocument.Uri hoverPos.Position
 
         let! contents =
@@ -1084,7 +753,10 @@ let setupServerHandlers options lspClient =
             | Some (sym, doc, pos) -> async {
                 let! ct = Async.CancellationToken
                 let! semanticModel = doc.GetSemanticModelAsync(ct) |> Async.AwaitTask
-                return csharpMarkdownDocForSymbol sym semanticModel pos
+
+                return Documentation.markdownDocForSymbolWithSignature sym semanticModel pos
+                       |> fun s -> MarkedString.WithLanguage { Language = "markdown"; Value = s }
+                       |> fun s -> [s]
               }
             | _ -> async { return [] }
 
@@ -1108,15 +780,86 @@ let setupServerHandlers options lspClient =
         | None -> return None |> success
     }
 
+    let handleTextDocumentPrepareRename (_scope: ServerRequestScope)
+                                        (prepareRename: PrepareRenameParams)
+                                        : AsyncLspResult<PrepareRenameResult option> =
+        async {
+            let! ct = Async.CancellationToken
+            let! docMaybe = getDocumentForUriFromCurrentState UserDocument
+                                                              prepareRename.TextDocument.Uri
+            let! prepareResult =
+                match docMaybe with
+                | Some doc -> async {
+                    let! docSyntaxTree = doc.GetSyntaxTreeAsync(ct) |> Async.AwaitTask
+                    let! docText = doc.GetTextAsync() |> Async.AwaitTask
+
+                    let position = docText.Lines.GetPosition(LinePosition(prepareRename.Position.Line, prepareRename.Position.Character))
+                    let! symbolMaybe = SymbolFinder.FindSymbolAtPositionAsync(doc, position, ct) |> Async.AwaitTask
+                    let symbolIsFromMetadata =
+                        symbolMaybe
+                        |> Option.ofObj
+                        |> Option.map (fun s -> s.MetadataToken <> 0)
+                        |> Option.defaultValue false
+
+                    let linePositionSpan = LinePositionSpan(
+                        roslynLinePositionForLspPosition prepareRename.Position,
+                        roslynLinePositionForLspPosition prepareRename.Position)
+
+                    let textSpan = docText.Lines.GetTextSpan(linePositionSpan)
+
+                    let! rootNode = docSyntaxTree.GetRootAsync() |> Async.AwaitTask
+                    let nodeOnPos = rootNode.FindNode(textSpan, findInsideTrivia=false, getInnermostNodeForTie=true)
+
+                    let spanMaybe =
+                        match nodeOnPos with
+                        | :? PropertyDeclarationSyntax as propDec -> propDec.Identifier.Span |> Some
+                        | :? MethodDeclarationSyntax as methodDec -> methodDec.Identifier.Span |> Some
+                        | :? BaseTypeDeclarationSyntax as typeDec -> typeDec.Identifier.Span |> Some
+                        | :? VariableDeclaratorSyntax as varDec -> varDec.Identifier.Span |> Some
+                        | :? EnumMemberDeclarationSyntax as enumMemDec -> enumMemDec.Identifier.Span |> Some
+                        | :? ParameterSyntax as paramSyn -> paramSyn.Identifier.Span |> Some
+                        | :? NameSyntax as nameSyn -> nameSyn.Span |> Some
+                        | :? SingleVariableDesignationSyntax as designationSyn -> designationSyn.Identifier.Span |> Some
+                        | :? ForEachStatementSyntax as forEachSyn -> forEachSyn.Identifier.Span |> Some
+                        | :? LocalFunctionStatementSyntax as localFunStSyn -> localFunStSyn.Identifier.Span |> Some
+                        | node ->
+                            logMessage (sprintf "handleTextDocumentPrepareRename: unhandled Type=%s" (string (node.GetType().Name)))
+                            None
+
+                    let rangeWithPlaceholderMaybe: PrepareRenameResult option =
+                        match spanMaybe, symbolIsFromMetadata with
+                        | Some span, false ->
+                            let range =
+                                docText.Lines.GetLinePositionSpan(span)
+                                |> lspRangeForRoslynLinePosSpan
+
+                            let text = docText.GetSubText(span) |> string
+                                                
+                            { Range = range; Placeholder = text }
+                            |> Types.PrepareRenameResult.RangeWithPlaceholder
+                            |> Some
+                        | _, _ ->
+                            None
+
+                    return rangeWithPlaceholderMaybe
+                  }
+                | None -> None |> async.Return
+
+            return prepareResult |> success
+        }
+
     let handleTextDocumentRename (scope: ServerRequestScope) (rename: Types.RenameParams): AsyncLspResult<Types.WorkspaceEdit option> = async {
+        let! ct = Async.CancellationToken
+
         let renameSymbolInDoc symbol (doc: Document) = async {
             let originalSolution = doc.Project.Solution
 
             let! updatedSolution =
                 Renamer.RenameSymbolAsync(doc.Project.Solution,
                                       symbol,
+                                      SymbolRenameOptions(RenameOverloads=true, RenameFile=true),
                                       rename.NewName,
-                                      doc.Project.Solution.Workspace.Options)
+                                      ct)
                 |> Async.AwaitTask
 
             let! docTextEdit =
@@ -1138,15 +881,153 @@ let setupServerHandlers options lspClient =
         return WorkspaceEdit.Create (docChanges |> Array.ofList, scope.ClientCapabilities.Value) |> Some |> success
     }
 
+    let handleTextDocumentSignatureHelp (scope: ServerRequestScope) (sigHelpParams: Types.SignatureHelpParams): AsyncLspResult<Types.SignatureHelp option> =
+        let docMaybe = scope.GetUserDocumentForUri sigHelpParams.TextDocument.Uri
+        match docMaybe with
+        | Some doc -> async {
+            let! ct = Async.CancellationToken
+            let! sourceText = doc.GetTextAsync(ct) |> Async.AwaitTask
+            let! semanticModel = doc.GetSemanticModelAsync(ct) |> Async.AwaitTask
+
+            let position =
+                LinePosition(sigHelpParams.Position.Line, sigHelpParams.Position.Character)
+                |> sourceText.Lines.GetPosition
+
+            let! syntaxTree = doc.GetSyntaxTreeAsync(ct) |> Async.AwaitTask
+            let! root = syntaxTree.GetRootAsync() |> Async.AwaitTask
+
+            let rec findInvocationContext (node: SyntaxNode): InvocationContext option =
+                match node with
+                | :? InvocationExpressionSyntax as invocation ->
+                    match invocation.ArgumentList.Span.Contains(position) with
+                    | true ->
+                        Some { Receiver      = invocation.Expression
+                               ArgumentTypes = (invocation.ArgumentList.Arguments |> Seq.map (fun a -> semanticModel.GetTypeInfo(a.Expression))) |> List.ofSeq
+                               Separators    = (invocation.ArgumentList.Arguments.GetSeparators()) |> List.ofSeq }
+                    | false -> findInvocationContext node.Parent
+
+                | :? BaseObjectCreationExpressionSyntax as objectCreation ->
+                    let argumentListContainsPosition =
+                        objectCreation.ArgumentList
+                        |> Option.ofObj
+                        |> Option.map (fun argList -> argList.Span.Contains(position))
+
+                    match argumentListContainsPosition with
+                    | Some true ->
+                        Some { Receiver      = objectCreation
+                               ArgumentTypes = (objectCreation.ArgumentList.Arguments |> Seq.map (fun a -> semanticModel.GetTypeInfo(a.Expression))) |> List.ofSeq
+                               Separators    = (objectCreation.ArgumentList.Arguments.GetSeparators()) |> List.ofSeq }
+                    | _ -> findInvocationContext node.Parent
+
+                | :? AttributeSyntax as attributeSyntax ->
+                    let argListContainsPosition =
+                        attributeSyntax.ArgumentList
+                        |> Option.ofObj
+                        |> Option.map (fun argList -> argList.Span.Contains(position))
+
+                    match argListContainsPosition with
+                    | Some true ->
+                        Some { Receiver      = attributeSyntax
+                               ArgumentTypes = (attributeSyntax.ArgumentList.Arguments |> Seq.map (fun a -> semanticModel.GetTypeInfo(a.Expression))) |> List.ofSeq
+                               Separators    = (attributeSyntax.ArgumentList.Arguments.GetSeparators()) |> List.ofSeq }
+
+                    | _ -> findInvocationContext node.Parent
+
+                | _ ->
+                    match node |> Option.ofObj with
+                    | Some nonNullNode -> findInvocationContext nonNullNode.Parent
+                    | None -> None
+
+            let invocationMaybe = root.FindToken(position).Parent
+                                  |> findInvocationContext
+            return
+                match invocationMaybe with
+                | Some invocation ->
+                    let methodGroup =
+                        (semanticModel.GetMemberGroup(invocation.Receiver)
+                                      .OfType<IMethodSymbol>())
+                        |> List.ofSeq
+
+                    let methodScore (m: IMethodSymbol) =
+                        if m.Parameters.Length < invocation.ArgumentTypes.Length then
+                            -1
+                        else
+                            let maxParams = Math.Max(m.Parameters.Length, invocation.ArgumentTypes.Length)
+                            let paramCountScore = maxParams - Math.Abs(m.Parameters.Length - invocation.ArgumentTypes.Length)
+
+                            let minParams = Math.Min(m.Parameters.Length, invocation.ArgumentTypes.Length)
+                            let paramMatchingScore =
+                                [0..minParams-1]
+                                |> Seq.map (fun pi -> (m.Parameters[pi], invocation.ArgumentTypes[pi]))
+                                |> Seq.map (fun (pt, it) -> SymbolEqualityComparer.Default.Equals(pt.Type, it.ConvertedType))
+                                |> Seq.map (fun m -> if m then 1 else 0)
+                                |> Seq.sum
+
+                            paramCountScore + paramMatchingScore
+
+                    let matchingMethodMaybe =
+                        methodGroup
+                        |> Seq.map (fun m -> (m, methodScore m))
+                        |> Seq.sortByDescending snd
+                        |> Seq.map fst
+                        |> Seq.tryHead
+
+                    let signatureForMethod (m: IMethodSymbol) =
+                        let parameters =
+                            m.Parameters
+                            |> Seq.map (fun p -> { Label = (string p); Documentation = None })
+                            |> Array.ofSeq
+
+                        let documentation =
+                            Types.Documentation.Markup {
+                                Kind = MarkupKind.Markdown
+                                Value = Documentation.markdownDocForSymbol m
+                            }
+
+                        { Label         = formatSymbol m true (Some semanticModel) (Some position)
+                          Documentation = Some documentation
+                          Parameters    = Some parameters
+                        }
+
+                    let activeParameterMaybe =
+                        match matchingMethodMaybe with
+                        | Some _ ->
+                            let mutable p = 0
+                            for comma in invocation.Separators do
+                                let commaBeforePos = comma.Span.Start < position
+                                p <- p + (if commaBeforePos then 1 else 0)
+                            Some p
+
+                        | None -> None
+
+                    let signatureHelpResult =
+                        { Signatures = methodGroup
+                                       |> Seq.map signatureForMethod
+                                       |> Array.ofSeq
+
+                          ActiveSignature = matchingMethodMaybe
+                                            |> Option.map (fun m -> List.findIndex ((=) m) methodGroup)
+
+                          ActiveParameter = activeParameterMaybe }
+
+                    Some signatureHelpResult |> success
+
+                | None ->
+                    None |> success
+          }
+
+        | None ->
+            None |> success |> async.Return
+
     let handleWorkspaceSymbol (scope: ServerRequestScope) (symbolParams: Types.WorkspaceSymbolParams): AsyncLspResult<Types.SymbolInformation [] option> = async {
         let! symbols = findSymbolsInSolution scope.Solution symbolParams.Query (Some 20)
         return symbols |> Array.ofSeq |> Some |> success
     }
 
-    let handleWorkspaceDidChangeWatchedFiles (scope: ServerRequestScope) (changeParams: Types.DidChangeWatchedFilesParams): Async<unit> = async {
+    let handleWorkspaceDidChangeWatchedFiles (scope: ServerRequestScope) (changeParams: Types.DidChangeWatchedFilesParams): Async<LspResult<unit>> = async {
         let tryReloadDocumentOnUri uri = async {
             match scope.GetDocumentForUriOfType UserDocument uri with
-            | Some (doc, docType) ->
+            | Some (doc, _) ->
                 let fileText = uri.Substring("file://".Length) |> File.ReadAllText
                 let updatedDoc = SourceText.From(fileText) |> doc.WithText
 
@@ -1171,7 +1052,6 @@ let setupServerHandlers options lspClient =
         }
 
         for change in changeParams.Changes do
-            let documentIsCSharpFile = change.Uri.EndsWith(".cs")
             match Path.GetExtension(change.Uri) with
             | ".csproj" ->
                 logMessage "change to .csproj detected, will reload solution"
@@ -1191,7 +1071,7 @@ let setupServerHandlers options lspClient =
 
                 | FileChangeType.Deleted ->
                     match scope.GetDocumentForUriOfType UserDocument change.Uri with
-                    | Some (existingDoc, docType) ->
+                    | Some (existingDoc, _) ->
                         let updatedProject = existingDoc.Project.RemoveDocument(existingDoc.Id)
 
                         scope.Emit(SolutionChange updatedProject.Solution)
@@ -1202,6 +1082,8 @@ let setupServerHandlers options lspClient =
                 | _ -> ()
 
             | _ -> ()
+
+        return LspResult.Ok()
     }
 
     let handleCSharpMetadata (scope: ServerRequestScope) (metadataParams: CSharpMetadataParams): AsyncLspResult<CSharpMetadataResponse option> = async {
@@ -1242,56 +1124,51 @@ let setupServerHandlers options lspClient =
             return formattingChanges |> Some |> success
         }
 
-    let withReadOnlyScope asyncFn param = async {
-        let! stateSnapshot = stateActor.PostAndAsyncReply(GetState)
-        use scope = new ServerRequestScope(stateSnapshot, stateActor.Post, fun () -> ())
-        return! asyncFn scope param
-    }
-
-    let withReadWriteScope asyncFn param =
+    let withScope requestType requestPriority asyncFn param =
         // we want to be careful and lock solution for change immediately w/o entering async/returing an `async` workflow
         //
         // StreamJsonRpc lib we're using in Ionide.LanguageServerProtocol guarantees that it will not call another
         // handler until previous one returns a Task (in our case -- F# `async` object.)
-        let stateSnapshot = stateActor.PostAndReply(StartSolutionChange)
 
-        // we want to run asyncFn within scope as scope.Dispose() will send FinishSolutionChange and will actually
-        // allow subsequent write request to run
+        let requestId, semaphore = stateActor.PostAndReply(fun rc -> StartRequest (requestType, requestPriority, rc))
+
         async {
-            use scope = new ServerRequestScope(stateSnapshot, stateActor.Post, fun () -> stateActor.Post(FinishSolutionChange))
-            return! asyncFn scope param
+            do! semaphore.WaitAsync() |> Async.AwaitTask
+
+            let state = stateActor.PostAndReply(GetState)
+
+            try
+                let scope = ServerRequestScope(state, stateActor.Post, logMessage)
+
+                let! resultOrExn = (asyncFn scope param) |> Async.Catch
+
+                return
+                    match resultOrExn with
+                    | Choice1Of2 result -> result
+                    | Choice2Of2 exn ->
+                        match exn with
+                        | :? TaskCanceledException -> LspResult.requestCancelled
+                        | :? OperationCanceledException -> LspResult.requestCancelled
+                        | _ -> LspResult.internalError (string exn)
+            finally
+                stateActor.Post(FinishRequest requestId)
         }
 
-    let withTimeoutOfMS (timeoutMS: int) asyncFn param = async {
-        let! baseCT = Async.CancellationToken
-        use timeoutCts = System.Threading.CancellationTokenSource.CreateLinkedTokenSource(baseCT)
-        timeoutCts.CancelAfter(timeoutMS)
-        return! Async.StartAsTask(asyncFn param, cancellationToken=timeoutCts.Token)
-                |> Async.AwaitTask
-    }
-
-    let withNotificationSuccess asyncFn param =
-        // we want to run asyncFn immediately outside of async scope so we still
-        // handle request immediately as sent in by StreamJsonRpc and handler
-        // has a change to process this before next request is accepted
-        let asyncFnResult = asyncFn param
-
-        // allow subsequent write request to run
-        async {
-            do! asyncFnResult
-            return Result.Ok()
-        }
+    let withReadOnlyScope asyncFn param = withScope ReadOnly 0 asyncFn param
+    let withReadOnlyScopeWithPriority priority asyncFn param = withScope ReadOnly priority asyncFn param
+    let withReadWriteScope asyncFn param = withScope ReadWrite 0 asyncFn param
 
     [
         "initialize"                     , handleInitialize                    |> withReadWriteScope |> requestHandling
-        "textDocument/didChange"         , handleTextDocumentDidChange         |> withReadWriteScope |> withNotificationSuccess |> requestHandling
-        "textDocument/didClose"          , handleTextDocumentDidClose          |> withReadWriteScope |> withNotificationSuccess |> requestHandling
-        "textDocument/didOpen"           , handleTextDocumentDidOpen           |> withReadWriteScope |> withNotificationSuccess |> requestHandling
-        "textDocument/didSave"           , handleTextDocumentDidSave           |> withReadWriteScope |> withNotificationSuccess |> requestHandling
+        "initialized"                    , handleInitialized                   |> withReadWriteScope |> requestHandling
+        "textDocument/didChange"         , handleTextDocumentDidChange         |> withReadWriteScope |> requestHandling
+        "textDocument/didClose"          , handleTextDocumentDidClose          |> withReadWriteScope |> requestHandling
+        "textDocument/didOpen"           , handleTextDocumentDidOpen           |> withReadWriteScope |> requestHandling
+        "textDocument/didSave"           , handleTextDocumentDidSave           |> withReadWriteScope |> requestHandling
         "textDocument/codeAction"        , handleTextDocumentCodeAction        |> withReadOnlyScope |> requestHandling
         "codeAction/resolve"             , handleCodeActionResolve             |> withReadOnlyScope |> requestHandling
-        "textDocument/codeLens"          , handleTextDocumentCodeLens          |> withReadOnlyScope |> requestHandling
-        "codeLens/resolve"               , handleCodeLensResolve               |> withReadOnlyScope |> withTimeoutOfMS 10000 |> requestHandling
+        "textDocument/codeLens"          , handleTextDocumentCodeLens          |> withReadOnlyScopeWithPriority 99 |> requestHandling
+        "codeLens/resolve"               , handleCodeLensResolve               |> withReadOnlyScope |> requestHandling
         "textDocument/completion"        , handleTextDocumentCompletion        |> withReadOnlyScope |> requestHandling
         "textDocument/definition"        , handleTextDocumentDefinition        |> withReadOnlyScope |> requestHandling
         "textDocument/documentHighlight" , handleTextDocumentDocumentHighlight |> withReadOnlyScope |> requestHandling
@@ -1302,9 +1179,11 @@ let setupServerHandlers options lspClient =
         "textDocument/onTypeFormatting"  , handleTextDocumentOnTypeFormatting  |> withReadOnlyScope |> requestHandling
         "textDocument/rangeFormatting"   , handleTextDocumentRangeFormatting   |> withReadOnlyScope |> requestHandling
         "textDocument/references"        , handleTextDocumentReferences        |> withReadOnlyScope |> requestHandling
+        "textDocument/prepareRename"     , handleTextDocumentPrepareRename     |> withReadOnlyScope |> requestHandling
         "textDocument/rename"            , handleTextDocumentRename            |> withReadOnlyScope |> requestHandling
+        "textDocument/signatureHelp"     , handleTextDocumentSignatureHelp     |> withReadOnlyScope |> requestHandling
         "workspace/symbol"               , handleWorkspaceSymbol               |> withReadOnlyScope |> requestHandling
-        "workspace/didChangeWatchedFiles", handleWorkspaceDidChangeWatchedFiles |> withReadWriteScope |> withNotificationSuccess |> requestHandling
+        "workspace/didChangeWatchedFiles", handleWorkspaceDidChangeWatchedFiles |> withReadWriteScope |> requestHandling
         "csharp/metadata"                , handleCSharpMetadata                |> withReadOnlyScope |> requestHandling
     ]
     |> Map.ofList
@@ -1318,6 +1197,7 @@ let startCore options =
         input
         output
         CSharpLspClient
+        defaultRpc
 
 let start options =
     try
